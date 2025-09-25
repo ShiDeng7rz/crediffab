@@ -221,7 +221,7 @@ if __name__ == '__main__':
                 train_loader,
                 total=len(train_loader),
                 desc=f"Epoch [{epoch}/{args.max_epoch}]",
-                leave=False,  # False：epoch 结束后会清掉这行
+                leave=False
             )
             optimizer.zero_grad(set_to_none=True)
             for step_idx, batch in enumerate(loop, start=1):
@@ -281,8 +281,12 @@ if __name__ == '__main__':
                         return loss
 
 
-                    loss_1 = info_nce_masked(z_ab_1, z_ag_1, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_1, y_ab, temp=0.07)
-                    loss_2 = info_nce_masked(z_ab_2, z_ag_2, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_2, y_ab, temp=0.07)
+                    loss_1 = info_nce_masked(z_ab_1, z_ag_1, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_1,
+                                                                                                              y_ab,
+                                                                                                              temp=0.07)
+                    loss_2 = info_nce_masked(z_ab_2, z_ag_2, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_2,
+                                                                                                              y_ab,
+                                                                                                              temp=0.07)
                     loss_raw = 0.5 * (loss_1 + loss_2)
                     for n, p in unwrap(cl_model).named_parameters():
                         if "logit_scale" in n:
@@ -320,7 +324,7 @@ if __name__ == '__main__':
                 total_seen += bs
 
             avg_loss = total_loss / max(total_seen, 1)
-            print("Epoch %d train loss %.6f" % (epoch + 1, avg_loss))
+            tqdm.write("Epoch %d train loss %.6f" % (epoch + 1, avg_loss))
 
 
             #######验证########
@@ -328,99 +332,95 @@ if __name__ == '__main__':
             def evaluate_retrieval(model, val_loader, device):
                 model.eval()
                 zs_ab, zs_ag = [], []
-                ids_ab, ids_ag = [], []
+                y_chunks = []
 
                 for batch in val_loader:
                     ab = recursive_to(batch['antibody'], device)
                     ag = recursive_to(batch['antigen'], device)
+
+                    # 批内对齐检查（局部索引）
+                    assert torch.equal(ab['batch_indices'], ag['batch_indices'])
+
+                    # 记录簇标签（顺序与 z_ab 对齐）
+                    y_chunks.append(ab['cluster'])
+
                     z_ab, _ = model(ab, True)
                     z_ag, _ = model(ag, False)
+
                     zs_ab.append(z_ab)
                     zs_ag.append(z_ag)
-                    ids_ab.append(ab['batch_indices'].to(device))
-                    ids_ag.append(ag['batch_indices'].to(device))
 
-                z_ab = F.normalize(torch.cat(zs_ab, 0), dim=1)
-                z_ag = F.normalize(torch.cat(zs_ag, 0), dim=1)
-                id_ab = torch.cat(ids_ab, 0)
-                id_ag = torch.cat(ids_ag, 0)
+                z_ab = F.normalize(torch.cat(zs_ab, 0), dim=1)  # [N,D]
+                z_ag = F.normalize(torch.cat(zs_ag, 0), dim=1)  # [N,D]
 
-                # 关键：基于 batch_indices 做“全局对齐”
-                common = torch.tensor(sorted(set(id_ab.tolist()) & set(id_ag.tolist())), device=device)
-                order_ab = torch.argsort(id_ab)
-                id_ab_sorted = id_ab[order_ab]
-                order_ag = torch.argsort(id_ag)
-                id_ag_sorted = id_ag[order_ag]
-                pos_ab = torch.searchsorted(id_ab_sorted, common)
-                pos_ag = torch.searchsorted(id_ag_sorted, common)
-                sel_ab = order_ab[pos_ab]
-                sel_ag = order_ag[pos_ag]
+                # 展平标签并映射到整型
+                flat_names = sum((list(x) for x in y_chunks), [])
+                y_ab = torch.tensor(
+                    [train_dataset.cluster_name_to_int.get(n, -1) for n in flat_names],
+                    dtype=torch.long, device=device
+                )
 
-                z_ab = z_ab[sel_ab]
-                z_ag = z_ag[sel_ag]
-                y_ab = train_dataset.cluster_id[sel_ab].to(device)
-                # 相似度矩阵（cosine）
-                S = z_ab @ z_ag.t()  # [Na, Ng]
+                # 相似度矩阵（对角即正样本）
+                S = z_ab @ z_ag.t()
+                N = S.size(0)
+                gt = torch.arange(N, device=device)
 
-                logits = S
+                # 指标
+                rank_ag = torch.argsort(S, dim=1, descending=True)
+                pos_rank_ab = (rank_ag == gt[:, None]).nonzero(as_tuple=False)[:, 1]
+                r1_ab = (pos_rank_ab == 0).float().mean().item()
+                r5_ab = (pos_rank_ab < 5).float().mean().item()
+                r10_ab = (pos_rank_ab < 10).float().mean().item()
+                mrr_ab = (1.0 / (pos_rank_ab.float() + 1)).mean().item()
 
-                B = logits.size(0)
-                labels = torch.arange(B, device=logits.device)
-                loss = info_nce_masked(z_ab, z_ag, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab, y_ab, temp=0.07)
+                rank_ab = torch.argsort(S.t(), dim=1, descending=True)
+                pos_rank_ag = (rank_ab == gt[:, None]).nonzero(as_tuple=False)[:, 1]
+                r1_ag = (pos_rank_ag == 0).float().mean().item()
+                r5_ag = (pos_rank_ag < 5).float().mean().item()
+                r10_ag = (pos_rank_ag < 10).float().mean().item()
+                mrr_ag = (1.0 / (pos_rank_ag.float() + 1)).mean().item()
 
-                def _retrieval_metrics(S):
-                    Na, Ng = S.shape
-                    # 假设验证集构造为“一一配对、顺序对齐”
-                    assert Na == Ng, "验证集需要一一配对对齐"
-                    gt = torch.arange(Na, device=S.device)
+                # margin（对称）
+                eye = torch.eye(N, device=device, dtype=torch.bool)
+                best_off_ab = S.masked_fill(eye, -1e9).max(dim=1).values
+                m_ab = (S.diag() - best_off_ab).mean().item()
+                best_off_ag = S.t().masked_fill(eye, -1e9).max(dim=1).values
+                m_ag = (S.t().diag() - best_off_ag).mean().item()
 
-                    # AB->AG
-                    rank_ag = torch.argsort(S, dim=1, descending=True)
-                    pos_rank_ab = (rank_ag == gt[:, None]).nonzero(as_tuple=False)[:, 1]
-                    r1_ab = (pos_rank_ab == 0).float().mean().item()
-                    r5_ab = (pos_rank_ab < 5).float().mean().item()
-                    r10_ab = (pos_rank_ab < 10).float().mean().item()
-                    mrr_ab = (1.0 / (pos_rank_ab.float() + 1)).mean().item()
+                # 可选：评估期监控损失（不反传）
+                mask = (y_ab >= 0)
+                if mask.any():
+                    val_loss = info_nce_masked(z_ab[mask], z_ag[mask], temp=0.07, y_ab=y_ab[mask]) \
+                               + 0.2 * supcon_samecluster(z_ab[mask], y_ab[mask], temp=0.07)
+                else:
+                    val_loss = torch.tensor(float('nan'), device=device)
+                N = S.size(0)
+                assert S.size(0) == S.size(1) and N > 0, f"S shape={S.shape}"
 
-                    # AG->AB
-                    rank_ab = torch.argsort(S.t(), dim=1, descending=True)
-                    pos_rank_ag = (rank_ab == gt[:, None]).nonzero(as_tuple=False)[:, 1]
-                    r1_ag = (pos_rank_ag == 0).float().mean().item()
-                    r5_ag = (pos_rank_ag < 5).float().mean().item()
-                    r10_ag = (pos_rank_ag < 10).float().mean().item()
-                    mrr_ag = (1.0 / (pos_rank_ag.float() + 1)).mean().item()
-
-                    # margin（对称）
-                    best_off_ab = S.clone()
-                    eye = torch.eye(S.size(0), device=S.device, dtype=torch.bool)
-                    best_off_ab[eye] = -1e9
-                    m_ab = (S.diag() - best_off_ab.max(dim=1).values).mean().item()
-
-                    best_off_ag = S.t().clone()
-                    best_off_ag[eye] = -1e9
-                    m_ag = (S.t().diag() - best_off_ag.max(dim=1).values).mean().item()
-
-                    metrics = {
-                        "R1": 0.5 * (r1_ab + r1_ag),
-                        "R5": 0.5 * (r5_ab + r5_ag),
-                        "R10": 0.5 * (r10_ab + r10_ag),
-                        "MRR": 0.5 * (mrr_ab + mrr_ag),
-                        "margin": 0.5 * (m_ab + m_ag),
-                        "loss": loss
-                    }
-                    return metrics
-
-                # 1) 统计对角线分布 vs 最大非对角
+                eye = torch.eye(N, device=S.device, dtype=torch.bool)
                 diag = S.diag()
-                offmax_row = (S - torch.eye(S.size(0), device=S.device) * 1e9).max(dim=1).values
-                print(f"[Eval] diag mean={diag.mean():.3f}, offmax mean={offmax_row.mean():.3f}, "
-                      f"diag>offmax ratio={(diag > offmax_row).float().mean().item():.3f}")
+                offmax_row = S.masked_fill(eye, -1e9).max(dim=1).values
 
-                # 2) 抽样看前5名排名
-                topk = torch.topk(S, k=5, dim=1).indices
-                mismatch = (topk[:, 0] != torch.arange(S.size(0), device=S.device)).float().mean().item()
-                print(f"[Eval] Top1 mismatch ratio={mismatch:.3f}")
-                return _retrieval_metrics(S)
+                from tqdm import tqdm
+                tqdm.write(
+                    f"[Eval] diag mean={diag.mean().item():.3f}, "
+                    f"offmax mean={offmax_row.mean().item():.3f}, "
+                    f"diag>offmax ratio={(diag > offmax_row).float().mean().item():.3f}"
+                )
+
+                top1 = torch.topk(S, k=1, dim=1).indices.squeeze(-1)
+                gt = torch.arange(N, device=S.device)
+                mismatch = (top1 != gt).float().mean().item()
+                tqdm.write(f"[Eval] Top1 mismatch ratio={mismatch:.3f}")
+                return {
+                    "R1": 0.5 * (r1_ab + r1_ag),
+                    "R5": 0.5 * (r5_ab + r5_ag),
+                    "R10": 0.5 * (r10_ab + r10_ag),
+                    "MRR": 0.5 * (mrr_ab + mrr_ag),
+                    "margin": 0.5 * (m_ab + m_ag),
+                    "loss": val_loss,
+                    "N": N,
+                }
 
 
             best_path = os.path.join(args.save_dir, "best_cl_model.pth")
@@ -435,37 +435,7 @@ if __name__ == '__main__':
                 torch.save(unwrap(cl_model).state_dict(), best_path)  # 原权重
                 print(f"模型已保存至: {best_path}")
 
-            # # ===================== 验证 =====================
-            # cl_model.eval()
-            # val_total, val_seen = 0.0, 0
-            # with torch.no_grad():
-            #     vloop = tqdm(valid_loader, total=len(valid_loader), desc=f"Valid [{epoch + 1}]", leave=False)
-            #     for vbatch in vloop:
-            #         ag_v, ab_v = vbatch['antigen'], vbatch['antibody']
-            #         ag_v = recursive_to(ag_v, args.device)
-            #         ab_v = recursive_to(ab_v, args.device)
-            #
-            #         with autocast('cuda', dtype=(torch.bfloat16 if use_bf16 else torch.float16), enabled=use_amp):
-            #             z_ab_v, _ = cl_model(ab_v)
-            #             z_ag_v, _ = cl_model(ag_v)
-            #             vloss = contrastive_loss(z_ab_v, z_ag_v, unwrap(cl_model).logit_scale)
-            #         bsv = z_ab_v.size(0)
-            #         val_total += float(vloss.detach().item()) * bsv
-            #         val_seen += bsv
-            #
-            # val_avg = val_total / max(val_seen, 1.0)
-            # print("Epoch %d valid loss %.6f" % (epoch + 1, val_avg))
-            # # ===================== 保存/早停（同步） =====================
-            #
-            # best_path = os.path.join(args.save_dir, "best_cl_model.pth")
-            # improved, should_stop = es.step(val_avg)
-            # if improved:
-            #     torch.save(unwrap(cl_model).state_dict(), best_path)
-            #     print(f"模型已保存至: {best_path}")
-            # else:
-            #     if should_stop:
-            #         print(f"早停触发，停止于 epoch {epoch + 1}（patience={es.patience}）")
-            #         break
+
 
     else:
 

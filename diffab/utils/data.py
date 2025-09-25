@@ -1,9 +1,8 @@
 import math
 import random
-from collections import defaultdict
 
+import numpy as np
 import torch
-from torch.utils.data import Sampler
 from torch.utils.data._utils.collate import default_collate
 
 DEFAULT_PAD_VALUES = {
@@ -264,94 +263,90 @@ def apply_patch_to_tensor(x_full, x_patch, patch_idx):
     return x_full
 
 
-class BalancedBatchSampler(Sampler[list]):
+class BalancedBatchSampler(torch.utils.data.Sampler):
     """
-    每个 batch = n_clusters 个簇 × n_per_cluster 条样本（不足时放回采样）。
-    labels: 长度为 len(dataset) 的一维数组/列表（簇ID，-1 表示无簇或忽略）
+    每个 batch 采 n_clusters 个簇，每簇 n_per 个样本。
+    - 剔除 label=-1（无簇）样本
+    - 不足时对簇内循环取（with replacement）
+    - __len__ 返回批次数；__iter__ 精确产生这些批次后停止
     """
-    def __init__(self, labels, n_clusters=5, n_per_cluster=4, drop_last=True, generator=None):
+    def __init__(self, labels, n_clusters, n_per_cluster, drop_last=True, seed=None):
         super().__init__()
-        self.labels = list(map(int, labels))
+        self.labels = np.asarray(labels, dtype=np.int64)
         self.n_clusters = int(n_clusters)
-        self.n_per_cluster = int(n_per_cluster)
+        self.n_per = int(n_per_cluster)
         self.drop_last = drop_last
-        self.generator = generator  # torch.Generator 或 None
+        self.rng = random.Random(seed)
 
-        # 建桶：簇ID -> [indices...]
-        buckets = defaultdict(list)
-        for idx, c in enumerate(self.labels):
-            if c >= 0:  # 只把有簇的放入均衡池；无簇样本可用另一 DataLoader 或在主Loader后补齐
-                buckets[c].append(idx)
-        # 过滤空桶
-        self.buckets = {c: idxs for c, idxs in buckets.items() if len(idxs) > 0}
-        self.clusters = list(self.buckets.keys())
-        if len(self.clusters) < self.n_clusters:
-            raise ValueError(f"可用簇数({len(self.clusters)}) < n_clusters({self.n_clusters})")
+        keep = self.labels >= 0
+        self.valid_idx = np.nonzero(keep)[0]
+        self.valid_lab = self.labels[self.valid_idx]
 
-        # 为每个簇做一个游标，便于“无放回”循环抽样
-        self._cursors = {c: 0 for c in self.clusters}
-        for c in self.clusters:
-            random.shuffle(self.buckets[c])
+        # 构建类到索引列表
+        self.cls2idx = {}
+        for idx, c in zip(self.valid_idx, self.valid_lab):
+            self.cls2idx.setdefault(int(c), []).append(int(idx))
+
+        # 没有任何有效簇，直接报错
+        if not self.cls2idx:
+            raise ValueError("No valid clusters (labels >= 0) in dataset.")
+
+        # 预洗牌
+        for c in self.cls2idx:
+            self.rng.shuffle(self.cls2idx[c])
+
+        # 估算批次数：按总可用样本粗略估算
+        total = sum(len(v) for v in self.cls2idx.values())
+        bs = self.n_clusters * self.n_per
+        self.num_batches = total // bs if drop_last else math.ceil(total / bs)
+
+        # 也可以改成：限定每簇的使用上限，算一个更保守的 num_batches
+
+        # 为每簇建一个读取指针
+        self.ptr = {c: 0 for c in self.cls2idx}
 
     def __len__(self):
-        # 粗略：按桶总量估算能组成的 batch 数
-        total = sum(len(v) for v in self.buckets.values())
-        per_batch = self.n_clusters * self.n_per_cluster
-        if self.drop_last:
-            return total // per_batch
-        else:
-            return math.ceil(total / per_batch)
+        return self.num_batches
 
-    def set_epoch(self, epoch: int):
-        # 让你在每个 epoch 调用，改变采样顺序（分布式时也常用）
-        rnd = random.Random(epoch)
-        rnd.shuffle(self.clusters)
-        for c in self.clusters:
-            rnd.shuffle(self.buckets[c])
-            self._cursors[c] = 0
-
-    def _sample_from_cluster(self, c, k, rnd):
-        """从簇 c 里取 k 个样本。不足则放回采样。"""
-        lst = self.buckets[c]
-        cur = self._cursors[c]
-        remain = len(lst) - cur
-        if remain >= k:
-            out = lst[cur:cur+k]
-            self._cursors[c] = cur + k
-            return out
-        # 不足：先拿剩余，再放回补齐
-        out = lst[cur:]
-        self._cursors[c] = len(lst)
-        need = k - remain
-        if need > 0:
-            # 放回补齐
-            out.extend(rnd.choices(lst, k=need))
-        # 若无放回用尽，重置并洗牌，保证后续还能继续
-        if self._cursors[c] >= len(lst):
-            rnd.shuffle(self.buckets[c])
-            self._cursors[c] = 0
+    def _take_from_class(self, c, k):
+        """从簇 c 取 k 个样本，不足则循环洗牌后继续取。"""
+        pool = self.cls2idx[c]
+        p = self.ptr[c]
+        out = []
+        need = k
+        while need > 0:
+            remain = len(pool) - p
+            if remain == 0:
+                self.rng.shuffle(pool)
+                p = 0
+                remain = len(pool)
+            t = min(need, remain)
+            out.extend(pool[p:p+t])
+            p += t
+            need -= t
+        self.ptr[c] = p
         return out
 
     def __iter__(self):
-        # 支持外部传入 torch.Generator 的种子；否则用 random
-        rnd = random.Random()
-        if self.generator is not None:
-            # 尝试根据 torch.Generator 取一个种子（可选）
-            try:
-                seed = int(self.generator.initial_seed())
-                rnd.seed(seed)
-            except Exception:
-                pass
+        classes = list(self.cls2idx.keys())
+        made = 0
+        while made < self.num_batches:
+            # 保证可抽足 n_clusters 个类
+            self.rng.shuffle(classes)
+            if len(classes) < self.n_clusters:
+                # 类的总数就这么多，直接循环补齐
+                chosen = []
+                while len(chosen) < self.n_clusters:
+                    chosen.extend(classes)
+                chosen = chosen[:self.n_clusters]
+            else:
+                chosen = classes[:self.n_clusters]
 
-        while True:
-            # 选 n_clusters 个不同的簇
-            chosen = rnd.sample(self.clusters, self.n_clusters)
             batch = []
             for c in chosen:
-                batch.extend(self._sample_from_cluster(c, self.n_per_cluster, rnd))
-            if len(batch) == self.n_clusters * self.n_per_cluster:
-                yield batch
-            else:
-                if not self.drop_last and len(batch) > 0:
-                    yield batch
-                break
+                batch.extend(self._take_from_class(c, self.n_per))
+
+            yield batch
+            made += 1
+        # 自然结束，StopIteration
+
