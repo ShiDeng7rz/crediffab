@@ -230,7 +230,8 @@ class SAbDabDataset(Dataset):
         self.db_conn = None
         self.db_ids = None
         self._load_structures(reset)
-
+        self.cluster_name_to_int = None
+        self.cluster_id = None
         self.clusters = None
         self.id_to_cluster = None
         self._load_clusters(reset)
@@ -359,6 +360,9 @@ class SAbDabDataset(Dataset):
         self.clusters = clusters
         self.id_to_cluster = id_to_cluster
 
+        # 新增：把 cluster_name 映射为整数 id，排序保证稳定
+        self.cluster_name_to_int = {name: i for i, name in enumerate(sorted(self.clusters.keys()))}
+
     def _create_clusters(self):
         cdr_records = []
         for id in self.db_ids:
@@ -414,6 +418,15 @@ class SAbDabDataset(Dataset):
         else:
             self.ids_in_split = ids_train_val[:]
 
+        # 新增：为本 split 生成一维簇 id 数组（与 __getitem__ 索引对齐）
+        cluster_ids = []
+        for sid in self.ids_in_split:
+            cname = self.id_to_cluster.get(sid, None)
+            if cname is None:
+                cluster_ids.append(-1)  # 没簇的置 -1（采样/损失时可跳过）
+            else:
+                cluster_ids.append(self.cluster_name_to_int[cname])
+        self.cluster_id = torch.tensor(cluster_ids, dtype=torch.long)
 
     def _connect_db(self):
         if self.db_conn is not None:
@@ -440,6 +453,12 @@ class SAbDabDataset(Dataset):
     def __getitem__(self, index):
         id = self.ids_in_split[index]
         data = self.get_structure(id)
+        if data['heavy'] is not None:
+            data['heavy']["cluster"] = self.id_to_cluster[id]
+        if data['light'] is not None:
+            data['light']["cluster"] = self.id_to_cluster[id]
+        if data['antigen'] is not None:
+            data['antigen']["cluster"] = self.id_to_cluster[id]
         if self.transform is not None:
             data = self.transform(data)
 

@@ -148,6 +148,7 @@ class Split_Chains(object):
         data_out = {
             **list_props,
             **tensor_props,
+            'cluster': data.get('cluster', None),
         }
 
         # ===== 选项 A：分别为“抗体组(heavy+light)”与“抗原组(antigen)”分配 chain_nb（各自从 0 编号）=====
@@ -185,7 +186,7 @@ class Split_Chains(object):
 
             list_props = {k: sum(v, start=[]) for k, v in list_props.items()}
             tensor_props = {k: torch.cat(v, dim=0) for k, v in tensor_props.items()}
-            return {**list_props, **tensor_props}
+            return {**list_props, **tensor_props, 'cluster': data.get('cluster', None)}
 
         # 分别组装
         ab_out = _assemble(ab_list)  # heavy+light 合并后的样本；若两者皆无则为 None

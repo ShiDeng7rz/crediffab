@@ -1,15 +1,16 @@
 import argparse
 import pickle
 import shutil
-import torch.nn.functional as F
+
 import faiss
+import torch.nn.functional as F
 import torch.utils.tensorboard
 from torch import optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from cl_model.cl_model import ContrastiveLearningModel, LOGIT_MIN, LOGIT_MAX
+from cl_model.cl_model import ContrastiveLearningModel, LOGIT_MIN, LOGIT_MAX, info_nce_masked, supcon_samecluster
 from diffab.datasets import get_dataset
 from diffab.models import get_model
 from diffab.utils.augment import build_two_views_pose_invariant
@@ -141,9 +142,11 @@ if __name__ == '__main__':
     val_dataset = get_dataset(config.dataset.val)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config.train.batch_size,
+        batch_sampler=BalancedBatchSampler(
+            labels=train_dataset.cluster_id.tolist(),
+            n_clusters=5, n_per_cluster=4, drop_last=True
+        ),
         collate_fn=SplitPaddingCollate(),
-        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=True,
@@ -224,7 +227,8 @@ if __name__ == '__main__':
             for step_idx, batch in enumerate(loop, start=1):
 
                 ag_data, ab_data = batch['antigen'], batch['antibody']
-
+                y_ab = torch.tensor([train_dataset.cluster_name_to_int.get(name, -1) for name in ab_data['cluster']],
+                                    dtype=torch.long, device=args.device)
                 # 如果 collate 对 antibody/antigen 分别做了排序/打包，可能需要从它们内部字段取各自的 id：
                 pid_ab = ab_data['batch_indices']
                 pid_ag = ag_data['batch_indices']
@@ -277,8 +281,8 @@ if __name__ == '__main__':
                         return loss
 
 
-                    loss_1 = _contrastive_with_mem(z_ab_1, z_ag_1)
-                    loss_2 = _contrastive_with_mem(z_ab_2, z_ag_2)
+                    loss_1 = info_nce_masked(z_ab_1, z_ag_1, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_1, y_ab, temp=0.07)
+                    loss_2 = info_nce_masked(z_ab_2, z_ag_2, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_2, y_ab, temp=0.07)
                     loss_raw = 0.5 * (loss_1 + loss_2)
                     for n, p in unwrap(cl_model).named_parameters():
                         if "logit_scale" in n:
@@ -354,7 +358,7 @@ if __name__ == '__main__':
 
                 z_ab = z_ab[sel_ab]
                 z_ag = z_ag[sel_ag]
-
+                y_ab = train_dataset.cluster_id[sel_ab].to(device)
                 # 相似度矩阵（cosine）
                 S = z_ab @ z_ag.t()  # [Na, Ng]
 
@@ -362,10 +366,7 @@ if __name__ == '__main__':
 
                 B = logits.size(0)
                 labels = torch.arange(B, device=logits.device)
-                loss = 0.5 * (
-                        torch.nn.functional.cross_entropy(logits, labels) +
-                        torch.nn.functional.cross_entropy(logits.t(), labels)
-                )
+                loss = info_nce_masked(z_ab, z_ag, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab, y_ab, temp=0.07)
 
                 def _retrieval_metrics(S):
                     Na, Ng = S.shape

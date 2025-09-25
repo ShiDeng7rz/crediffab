@@ -421,7 +421,6 @@ class ContrastiveLearningModel(nn.Module):
         else:
             z_proj = self.proj_head_ag(z_graph)
 
-
         z = F.normalize(z_proj, dim=1)
 
         logit_scale_safe = self.logit_scale.clamp(LOGIT_MIN, LOGIT_MAX)
@@ -438,3 +437,33 @@ def contrastive_loss(z_ab: torch.Tensor, z_ag: torch.Tensor, logit_scale):
     loss = 0.5 * (F.cross_entropy(logits, labels) +
                   F.cross_entropy(logits.t(), labels))
     return loss
+
+
+def supcon_samecluster(z, y, temp=0.07):
+    # z: [B,D] 已 F.normalize；y: [B] (同簇为正), -1 表示无簇
+    B = z.size(0)
+    sim = (z @ z.t()) / temp  # [B,B]
+    same = (y[:, None] == y[None, :]) & (y[:, None] >= 0)
+    same.fill_diagonal_(False)
+    row_mask = same.any(dim=1)
+    if not row_mask.any():
+        return z.new_tensor(0.)
+    # SupCon:  log( sum_j∈P_i exp(sim_ij) / sum_k!=i exp(sim_ik) )
+    pos = torch.where(same[row_mask], sim[row_mask], sim.new_full(sim[row_mask].shape, -1e9))
+    log_pos = torch.logsumexp(pos, dim=1)
+    log_all = torch.logsumexp(sim[row_mask] - torch.eye(B, device=z.device)[row_mask] * 1e9, dim=1)
+    return -(log_pos - log_all).mean()
+
+
+def info_nce_masked(z_ab, z_ag, temp, y_ab):
+    # z_ab/z_ag: [B,D] 归一化；y_ab: [B]
+    B = z_ab.size(0)
+    S = (z_ab @ z_ag.t()) / temp  # [B,B]
+    labels = torch.arange(B, device=z_ab.device)
+
+    # 屏蔽同簇的“非配对项”
+    same = (y_ab[:, None] == y_ab[None, :]) & (y_ab[:, None] >= 0)
+    mask = same & (~torch.eye(B, dtype=torch.bool, device=z_ab.device))
+    S = S.masked_fill(mask, -1e9)
+
+    return 0.5 * (F.cross_entropy(S, labels) + F.cross_entropy(S.t(), labels))
