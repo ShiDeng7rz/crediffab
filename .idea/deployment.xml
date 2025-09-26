@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" serverName="h800" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" serverName="root@36.155.152.28:47689 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="A6000-5">
@@ -161,6 +161,13 @@
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@36.155.152.28:47689 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/root/bayes-tmp/liups/cre-diffab-main/" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
