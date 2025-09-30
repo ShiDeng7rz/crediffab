@@ -15,6 +15,9 @@ from tqdm.auto import tqdm
 from cl_model.cl_premodel import ContrastiveLearningModel, LOGIT_MIN, LOGIT_MAX, info_nce_masked, supcon_samecluster
 from diffab.datasets import get_dataset
 from diffab.models import get_model
+from diffab.utils.antiberty_feature import (
+    add_antibody_language_features_to_batch, AntibodyLanguageModelExtractor,
+)
 from diffab.utils.augment import build_two_views_pose_invariant
 from diffab.utils.data import *
 from diffab.utils.esm_feature import ESMFeatureExtractor, add_esm_features_to_batch
@@ -208,6 +211,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_epoch', type=int, default=500)
     parser.add_argument('--is_train', type=int, default=0, help='train or save embeddings')
     parser.add_argument('--save_dir', type=str, default='./trained_models/retrieval')
+    parser.add_argument('--antiberty_model', type=str, default='immune-repertoire/antiberty-base')
+    parser.add_argument('--antiberty_batch_size', type=int, default=4)
     args = parser.parse_args()
 
     # Load configs
@@ -329,6 +334,11 @@ if __name__ == '__main__':
         if isinstance(args.device, str) and args.device.startswith('cuda') and torch.cuda.is_available()
         else 'cpu'
     )
+    antiberty_extractor = AntibodyLanguageModelExtractor(
+
+        device=esm_device,
+        max_batch_size=getattr(args, 'antiberty_batch_size', 4),
+    )
     esm_extractor = ESMFeatureExtractor(device=esm_device, max_batch_size=getattr(args, 'esm_batch_size', 4))
     # 开始训练
     if args.is_train == 0:
@@ -355,7 +365,7 @@ if __name__ == '__main__':
 
                 mask_ag_cpu = _get_valid_mask(ag_data)
                 mask_ab_cpu = _get_valid_mask(ab_data)
-                add_esm_features_to_batch(ab_data, mask_ab_cpu, esm_extractor, ('esm2',))
+                add_antibody_language_features_to_batch(ab_data, mask_ab_cpu, antiberty_extractor, ('antiberty',))
                 add_esm_features_to_batch(ag_data, mask_ag_cpu, esm_extractor, ('esm2',))
 
                 # 可以做数据增强
@@ -424,8 +434,8 @@ if __name__ == '__main__':
                 for batch in val_loader:
                     ab_dict = batch['antibody']
                     ag_dict = batch['antigen']
-                    add_esm_features_to_batch(ab_dict, _get_valid_mask(ab_dict), esm_extractor,
-                                              ('esm2',))
+                    add_antibody_language_features_to_batch(ab_dict, _get_valid_mask(ab_dict), antiberty_extractor,
+                                                            ('antiberty',))
                     add_esm_features_to_batch(ag_dict, _get_valid_mask(ag_dict), esm_extractor,
                                               ('esm2',))
                     ab = recursive_to(ab_dict, device)

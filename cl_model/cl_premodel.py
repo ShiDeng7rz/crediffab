@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from cl_model.egnn_clean import EGNN
 from cl_model.position_embedding import SinusoidalPositionEmbedding
-from diffab.utils.protein.constants import max_num_heavyatoms, BBHeavyAtom
+from diffab.utils.protein.constants import BBHeavyAtom
 
 LOGIT_MIN = math.log(1 / 100.0)  # 1/T ∈ [0.01, 100]
 LOGIT_MAX = math.log(100.0)
@@ -326,6 +326,7 @@ class ContrastiveLearningModel(nn.Module):
             'sasa',
             'surface_prior',
             'dssp',
+            'antiberty',
             'esm_if1',
             'esm2',
             'esm',
@@ -376,7 +377,15 @@ class ContrastiveLearningModel(nn.Module):
 
         extras = {}
         for key, store in optional_collect.items():
-            extras[key] = torch.cat(store, dim=0) if store else torch.empty(0, device=device)
+            if store:
+                extras[key] = torch.cat(store, dim=0)
+                continue
+            value = data[key]
+            if value.dim() <= 2:
+                shape: Tuple[int, ...] = (0,)
+            else:
+                shape = (0, *value.shape[2:])
+            extras[key] = value.new_zeros(shape)
 
         return EncoderOutput(
             node_feat=aa_cat,
@@ -422,7 +431,10 @@ class ContrastiveLearningModel(nn.Module):
         relpos_emb = self.relpos_embed(relpos + self.max_relpos)
         edge_attr = torch.cat([rbf_feat, same_chain, relpos_emb], dim=-1)
 
-        esm_key_order = ('esm_if1', 'esm2', 'esm') if is_antibody else ('esm2', 'esm_if1', 'esm')
+        if is_antibody:
+            esm_key_order = ('antiberty',)
+        else:
+            esm_key_order = ('esm2',)
         esm_tensor = None
         for key in esm_key_order:
             if key in packed.extras:
@@ -531,13 +543,12 @@ def contrastive_loss(z_ab: torch.Tensor, z_ag: torch.Tensor, logit_scale: torch.
     logits = (z_ab @ z_ag.t()) * scale
     labels = torch.arange(z_ab.size(0), device=z_ab.device)
     loss = 0.5 * (
-        F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)
+            F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)
     )
     return loss
 
 
 def supcon_samecluster(z: torch.Tensor, y: torch.Tensor, temp: float = 0.25) -> torch.Tensor:
-
     B = z.size(0)
     sim = (z @ z.t()) / temp
     same = (y[:, None] == y[None, :]) & (y[:, None] >= 0)
