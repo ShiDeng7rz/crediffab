@@ -367,6 +367,7 @@ if __name__ == '__main__':
                 )
                 paratope_mask, epitope_mask = compute_interface_masks(ab_data, ag_data)
                 surface_prior = normalize_surface_prior(ag_data.get('sasa'), _get_valid_mask(ag_data))
+                assign_weak_labels((ab_v1, ab_v2), (ag_v1, ag_v2), paratope_mask, epitope_mask, surface_prior)
                 with autocast('cuda', dtype=autocast_dtype, enabled=use_amp):
                     z_ab_1, _, aux_ab_1 = cl_model(ab_v1, True)
                     z_ag_1, _, aux_ag_1 = cl_model(ag_v1, False)
@@ -581,8 +582,8 @@ if __name__ == '__main__':
                 ab_data = recursive_to(ab_data, args.device)
 
                 with autocast('cuda', dtype=(torch.bfloat16 if use_bf16 else torch.float16), enabled=use_amp):
-                    z_ab, _ = cl_model(ab_data)  # [B, D]
-                    z_ag, _ = cl_model(ag_data)  # [B, D]
+                    z_ab, _, _ = cl_model(ab_data)  # [B, D]
+                    z_ag, _, _ = cl_model(ag_data)  # [B, D]
                 all_ab_embs.append(z_ab.cpu())
                 all_ag_embs.append(z_ag.cpu())
 

@@ -43,7 +43,7 @@ dataset:
       selection: CDR3
     - type: split_chains
 #    - type: patch_around_anchor
-    - type: patch_cdr_epitope
+#    - type: patch_cdr_epitope
   val:
     type: sabdab
     summary_path: ./data/sabdab_summary_all.tsv
@@ -55,7 +55,7 @@ dataset:
       selection: CDR3
     - type: split_chains
 #    - type: patch_around_anchor
-    - type: patch_cdr_epitope
+#    - type: patch_cdr_epitope
   save_emb:
     type: sabdab
     summary_path: ./data/sabdab_summary_all.tsv
