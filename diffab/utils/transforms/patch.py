@@ -208,10 +208,75 @@ def _generate_graph_edges(
     return edge_index
 
 
+def _compute_residue_representatives(pos_atoms, mask_atoms):
+    """Return per-residue representative coordinates and validity mask."""
+    ca_index = constants.BBHeavyAtom.CA
+    device = pos_atoms.device
+
+    has_any = mask_atoms.any(dim=1)
+    if mask_atoms.size(1) == 0:
+        return pos_atoms.new_zeros(pos_atoms.size(0), 3), has_any
+
+    if ca_index < mask_atoms.size(1):
+        has_ca = mask_atoms[:, ca_index]
+        pos_rep = pos_atoms[:, ca_index]
+    else:
+        has_ca = torch.zeros_like(has_any)
+        pos_rep = pos_atoms.new_zeros(pos_atoms.size(0), 3)
+
+    # fallback to the first valid atom when CA is missing
+    idx_first_valid = torch.argmax(mask_atoms.float(), dim=1)
+    fallback = pos_atoms[torch.arange(pos_atoms.size(0), device=device), idx_first_valid]
+    pos_rep = torch.where(has_ca[:, None], pos_rep, fallback)
+
+    # zero-out invalid residues explicitly
+    pos_rep = torch.where(has_any[:, None], pos_rep, torch.zeros_like(pos_rep))
+    return pos_rep, has_any
+
+
+def compute_interface_masks_complex(complex_data, distance_threshold=8.0):
+    """Compute paratope/epitope masks for a complex without altering it."""
+    fragment_type = complex_data['fragment_type']
+    pos_atoms = complex_data['pos_heavyatom']
+    mask_atoms = complex_data['mask_heavyatom']
+
+    antibody_mask = fragment_type != constants.Fragment.Antigen
+    antigen_mask = fragment_type == constants.Fragment.Antigen
+
+    paratope_mask = torch.zeros_like(fragment_type, dtype=torch.bool)
+    epitope_mask = torch.zeros_like(fragment_type, dtype=torch.bool)
+
+    if not antibody_mask.any() or not antigen_mask.any():
+        return paratope_mask, epitope_mask
+
+    pos_rep, valid_mask = _compute_residue_representatives(pos_atoms, mask_atoms)
+
+    valid_ab = antibody_mask & valid_mask
+    valid_ag = antigen_mask & valid_mask
+
+    if not valid_ab.any() or not valid_ag.any():
+        return paratope_mask, epitope_mask
+
+    pos_ab = pos_rep[valid_ab]
+    pos_ag = pos_rep[valid_ag]
+
+    dist = torch.cdist(pos_ab, pos_ag)
+
+    contact_ab = (dist.min(dim=1).values <= distance_threshold)
+    contact_ag = (dist.min(dim=0).values <= distance_threshold)
+
+    paratope_indices = torch.where(valid_ab)[0]
+    epitope_indices = torch.where(valid_ag)[0]
+    paratope_mask[paratope_indices] = contact_ab
+    epitope_mask[epitope_indices] = contact_ag
+
+    return paratope_mask, epitope_mask
+
+
 @register_transform('patch_cdr_epitope')
 class PatchCDREpitope(object):
 
-    def __init__(self, initial_patch_size=96, antigen_size=128):
+    def __init__(self, initial_patch_size=128, antigen_size=128):
         super().__init__()
         self.initial_patch_size = initial_patch_size
         self.antigen_size = antigen_size
@@ -220,75 +285,16 @@ class PatchCDREpitope(object):
         antibody = data['antibody']
         antigen = data['antigen']
         complex = data['complex']
-
-        anchor_flag = complex['anchor_flag']  # (L,)
-        anchor_points = complex['pos_heavyatom'][anchor_flag, constants.BBHeavyAtom.CA]  # (n_anchors, 3)
-        antigen_mask = (complex['fragment_type'] == constants.Fragment.Antigen)
-        antibody_mask = torch.logical_not(antigen_mask)
-
-        pos_alpha = complex['pos_heavyatom'][:, constants.BBHeavyAtom.CA]  # (L, 3)
-        dist_anchor = torch.cdist(pos_alpha, anchor_points).min(dim=1)[0]  # (L, )
-        initial_patch_idx = torch.topk(
-            dist_anchor,
-            k=min(self.initial_patch_size, dist_anchor.size(0)),
-            largest=False,
-        )[1]  # (initial_patch_size, )
-
-        dist_anchor_antigen = dist_anchor.masked_fill(
-            mask=antibody_mask,  # Fill antibody with +inf
-            value=float('+inf')
-        )  # (L, )
-        antigen_patch_idx = torch.topk(
-            dist_anchor_antigen,
-            k=min(self.antigen_size, antigen_mask.sum().item()),
-            largest=False, sorted=True
-        )[1]  # (ag_size, )
-
-        patch_mask = torch.logical_or(
-            complex['generate_flag'],
-            complex['anchor_flag'],
-        )
-        patch_mask[initial_patch_idx] = True
-        patch_mask[antigen_patch_idx] = True
-
-        # 复合物（全局）索引
-        complex_patch_idx = torch.arange(0, patch_mask.shape[0])[patch_mask]
-
-        # === 2) 把 complex 的 patch 映射到 antibody / antigen 的局部掩码 ===
-        # 说明：若 complex 是按某个顺序拼的（常见是先抗体再抗原），
-        # 下面这种“先用 fragment mask 过滤，再用 patch_mask 取子掩码”的方式
-        # 与具体拼接顺序无关，安全且通用。
-        antibody_local_mask = patch_mask[antibody_mask]  # 长度 == antibody 的残基数
-        antigen_local_mask = patch_mask[antigen_mask]  # 长度 == antigen  的残基数
-
-        # === 3) 分别裁剪 antibody / antigen / complex ===
-        antibody_patch = _mask_select_data(antibody, antibody_local_mask)
-        antigen_patch = _mask_select_data(antigen, antigen_local_mask)
-        complex_patch = _mask_select_data(complex, patch_mask)
-
-        # === 4) 记录各自的 patch_idx（局部与全局都给，便于追踪）===
-        # 全局（复合物）索引
-        complex_patch['patch_idx'] = complex_patch_idx
-
-        # 抗体/抗原的“局部”索引（相对各自链起点的索引）
-        La = antibody['aa'].size(0) if antibody is not None else 0
-        Lg = antigen['aa'].size(0) if antigen is not None else 0
-        if La > 0:
-            antibody_patch['patch_idx'] = torch.arange(La)[antibody_local_mask]
-        if Lg > 0:
-            antigen_patch['patch_idx'] = torch.arange(Lg)[antigen_local_mask]
-
-        antibody_patch['edges'] = _generate_graph_edges(
-            antibody_patch['pos_heavyatom'], antibody_patch['fragment_type'], antibody_patch['mask_heavyatom']
-        )
-        antigen_patch['edges'] = _generate_graph_edges(
-            antigen_patch['pos_heavyatom'], antigen_patch['fragment_type'], antigen_patch['mask_heavyatom']
-        )
-
-        # === 5) 组装返回 ===
-        data_patch = {
-            'antibody': antibody_patch,
-            'antigen': antigen_patch,
-            'complex': complex_patch,
-        }
-        return data_patch
+        paratope_mask, epitope_mask = compute_interface_masks_complex(complex)
+        complex['paratope_mask'] = paratope_mask
+        complex['epitope_mask'] = epitope_mask
+        fragment_type = complex['fragment_type']
+        if isinstance(antibody, dict):
+            ab_mask = (fragment_type != constants.Fragment.Antigen)
+            antibody['paratope_mask'] = paratope_mask[ab_mask]
+            antibody['epitope_mask'] = torch.zeros_like(antibody['paratope_mask'])
+        if isinstance(antigen, dict):
+            ag_mask = (fragment_type == constants.Fragment.Antigen)
+            antigen['epitope_mask'] = epitope_mask[ag_mask]
+            antigen['paratope_mask'] = torch.zeros_like(antigen['epitope_mask'])
+        return data

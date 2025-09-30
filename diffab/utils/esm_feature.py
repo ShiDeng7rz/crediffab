@@ -1,0 +1,743 @@
+import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
+
+import torch
+
+from diffab.datasets.AminoAcidVocab import ORDERED_SYMBOLS
+from diffab.utils.protein.constants import BBHeavyAtom
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _build_aa_lookup() -> Dict[int, str]:
+    table: Dict[int, str] = {}
+    for idx, symbol in enumerate(ORDERED_SYMBOLS):
+        # Ensure uppercase residues for ESM input; fallback to 'X' for unknowns.
+        table[idx] = symbol.upper()
+    return table
+
+
+AA_INDEX_TO_LETTER = _build_aa_lookup()
+DEFAULT_RESIDUE = "X"
+
+
+def tensor_to_sequence(residue_ids: torch.Tensor) -> str:
+    """Convert a 1D tensor of amino-acid indices to an ESM-compatible string."""
+    if residue_ids.dim() != 1:
+        raise ValueError(f"Expected 1D tensor of residue ids, got shape {tuple(residue_ids.shape)}")
+    letters: List[str] = []
+    for idx in residue_ids.tolist():
+        letters.append(AA_INDEX_TO_LETTER.get(int(idx), DEFAULT_RESIDUE))
+    return "".join(letters)
+
+
+@dataclass
+class ChainRecord:
+    batch_idx: int
+    chain_label: str | int
+    positions: List[int]
+    residue_indices: List[int]
+    window_positions: List[int]
+    window_residue_indices: List[int]
+    gather_indices: List[int]
+
+
+class ESMFeatureExtractor:
+    """Utility to lazily load ESM models and cache per-sequence embeddings."""
+
+    MODEL_SPECS: Dict[str, str] = {
+        "esm_if1": "esm_if1_gvp4_t16_142M_UR50",
+        "esm2": "esm2_t33_650M_UR50D",
+        "esm": "esm1_t34_670M_UR50D",
+    }
+
+    def __init__(
+        self,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype = torch.float32,
+        max_batch_size: int = 4,
+        chain_window_margin: int | None = 64,
+    ) -> None:
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.max_batch_size = max(1, int(max_batch_size))
+        if chain_window_margin is None:
+            self.chain_window_margin = 0
+        else:
+            self.chain_window_margin = max(0, int(chain_window_margin))
+        self.models: Dict[str, torch.nn.Module] = {}
+        self.alphabets = {}
+        self.batch_converters = {}
+        self.model_layers: Dict[str, int] = {}
+        self.model_dims: Dict[str, int] = {}
+        self.cache: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
+
+    def _ensure_model(self, key: str) -> None:
+        if key in self.models:
+            return
+        if key not in self.MODEL_SPECS:
+            raise KeyError(f"Unknown ESM model key: {key}")
+        try:
+            import esm
+        except ImportError as exc:  # pragma: no cover - dependency missing
+            raise RuntimeError(
+                "The 'esm' package is required to compute ESM features. Install it via `pip install fair-esm`."
+            ) from exc
+
+        loader_name = self.MODEL_SPECS[key]
+        if not hasattr(esm.pretrained, loader_name):
+            raise RuntimeError(f"ESM pretrained loader '{loader_name}' not found in esm.pretrained")
+
+        loader = getattr(esm.pretrained, loader_name)
+        model, alphabet = loader()
+        model.eval()
+        model = model.to(self.device)
+        if self.dtype == torch.float16:
+            model = model.half()
+        elif self.dtype == torch.bfloat16:
+            model = model.bfloat16()
+        else:
+            model = model.float()
+        for param in model.parameters():
+            param.requires_grad_(False)
+
+        layer = getattr(model, "num_layers", None)
+        if layer is None:
+            raise RuntimeError(f"Unable to infer number of layers for ESM model '{key}'")
+        dim = getattr(model, "embed_dim", None)
+        if dim is None:
+            dim = getattr(model, "embedding_dim", None)
+        if dim is None:
+            raise RuntimeError(f"Unable to infer embedding dimension for ESM model '{key}'")
+
+        self.models[key] = model
+        self.alphabets[key] = alphabet
+        self.batch_converters[key] = alphabet.get_batch_converter()
+        self.model_layers[key] = int(layer)
+        self.model_dims[key] = int(dim)
+
+    def get_model_dim(self, key: str) -> int | None:
+        return self.model_dims.get(key)
+
+    def embed_batch(self, key: str, sequences: Sequence[str]) -> List[torch.Tensor]:
+        """Embed a batch of sequences with the specified model key."""
+        if not sequences:
+            return []
+        self._ensure_model(key)
+        outputs: List[torch.Tensor | None] = [self.cache[key].get(seq) for seq in sequences]
+        missing: List[Tuple[int, str]] = [
+            (idx, seq) for idx, (seq, cached) in enumerate(zip(sequences, outputs)) if cached is None
+        ]
+        if missing:
+            converter = self.batch_converters[key]
+            layer = self.model_layers[key]
+            model = self.models[key]
+            # Process in mini-batches to control memory usage.
+            for start in range(0, len(missing), self.max_batch_size):
+                chunk = missing[start:start + self.max_batch_size]
+                if not chunk:
+                    continue
+                labels = [f"seq_{i}" for i, _ in chunk]
+                chunk_seqs = [seq for _, seq in chunk]
+                batch_inputs = list(zip(labels, chunk_seqs))
+                _, _, tokens = converter(batch_inputs)
+                tokens = tokens.to(self.device)
+                with torch.no_grad():
+                    result = model(tokens, repr_layers=[layer], return_contacts=False)
+                reps = result["representations"][layer].to(torch.float32).cpu()
+                for row, (out_idx, seq) in enumerate(chunk):
+                    length = len(seq)
+                    emb = reps[row, 1:length + 1].contiguous()
+                    self.cache[key][seq] = emb
+                    outputs[out_idx] = emb
+        return [tensor.contiguous() for tensor in outputs]  # type: ignore[arg-type]
+
+    def embed_batch_from_tensor(
+        self,
+        aa: torch.Tensor,
+        mask: torch.Tensor,
+        key: str,
+        coords: torch.Tensor | None = None,
+        coord_mask: torch.Tensor | None = None,
+        chain_ids: Sequence[Sequence[Any]] | torch.Tensor | None = None,
+        residue_index: Sequence[Sequence[Any]] | torch.Tensor | None = None,
+        chain_window_margin: int | None = None,
+    ) -> torch.Tensor:
+        """Compute per-residue embeddings for a batch of padded tensors.
+
+        Args:
+            aa: Amino-acid indices shaped ``[B, L]``.
+            mask: Boolean mask with the same shape as ``aa``.
+            key: Which pretrained ESM variant to query.
+            coords: Optional heavy-atom coordinates ``[B, L, A, 3]``.
+            coord_mask: Optional heavy-atom mask ``[B, L, A]`` aligned with ``coords``.
+            chain_ids: Optional per-residue chain identifiers used to split multi-chain
+                complexes before running ESM. Accepts either a tensor of shape
+                ``[B, L]`` or a nested sequence mirroring the batch layout.
+            residue_index: Optional per-residue numbering used to order residues
+                within each chain. Falls back to the tensor index when omitted.
+        """
+        if aa.dim() != 2:
+            raise ValueError(f"Expected aa tensor of shape [B, L], got {tuple(aa.shape)}")
+        if mask.shape != aa.shape:
+            raise ValueError(
+                f"Mask shape {tuple(mask.shape)} must match amino acid tensor shape {tuple(aa.shape)}"
+            )
+        if not mask.any():
+            LOGGER.debug("All residues masked for key %s; skipping ESM extraction.", key)
+            # Return an empty tensor to signal that no embeddings were produced.
+            return torch.zeros(0, dtype=torch.float32)
+
+        aa_cpu = aa.detach().cpu()
+        mask_cpu = mask.detach().cpu().bool()
+        coords_cpu = coords.detach().cpu() if coords is not None else None
+        coord_mask_cpu = coord_mask.detach().cpu().bool() if coord_mask is not None else None
+        chain_rows = self._normalize_chain_annotations(chain_ids, aa_cpu.shape) if chain_ids is not None else None
+        residue_rows = (
+            self._normalize_nested(residue_index, aa_cpu.shape, "residue_index")
+            if residue_index is not None
+            else None
+        )
+        self._ensure_model(key)
+        dim = self.model_dims[key]
+        B, L = aa_cpu.shape
+        outputs = torch.zeros(B, L, dim, dtype=torch.float32)
+        margin = self._resolve_window_margin(chain_window_margin)
+
+        if chain_rows is not None:
+            return self._embed_with_chain_split(
+                key,
+                aa_cpu,
+                mask_cpu,
+                outputs,
+                chain_rows,
+                residue_rows,
+                coords_cpu,
+                coord_mask_cpu,
+                margin,
+            )
+
+        if key == "esm_if1" and coords is not None and coord_mask is not None:
+            try:
+                return self._embed_if1_with_structure(
+                    aa_cpu,
+                    mask_cpu,
+                    coords_cpu,
+                    coord_mask_cpu,
+                    outputs,
+                )
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                LOGGER.warning(
+                    "Falling back to sequence-only embeddings for esm_if1 due to error: %s",
+                    exc,
+                )
+
+        sequences: List[str] = []
+        owners: List[Tuple[int, torch.Tensor]] = []
+        for b in range(B):
+            valid = mask_cpu[b]
+            if not torch.any(valid):
+                continue
+            seq = tensor_to_sequence(aa_cpu[b][valid])
+            if not seq:
+                continue
+            sequences.append(seq)
+            owners.append((b, valid))
+        if not sequences:
+            return outputs
+
+        embeddings = self.embed_batch(key, sequences)
+        for (b, valid), emb in zip(owners, embeddings):
+            if emb.size(0) != int(valid.sum().item()):
+                raise RuntimeError(
+                    f"Mismatch between embedding length {emb.size(0)} and valid residues {int(valid.sum().item())}"
+                )
+            outputs[b, valid] = emb
+        return outputs
+
+    def _normalize_nested(
+        self,
+        value: Sequence[Sequence[Any]] | torch.Tensor,
+        shape: Tuple[int, int],
+        name: str,
+    ) -> List[List[Any]]:
+        B, L = shape
+        if isinstance(value, torch.Tensor):
+            if value.dim() == 1:
+                if value.numel() != B * L:
+                    raise ValueError(f"{name} tensor has incompatible shape {tuple(value.shape)} for {shape}")
+                value = value.view(B, L)
+            if value.dim() != 2 or value.size(0) != B:
+                raise ValueError(f"{name} tensor must have shape [B, L]; got {tuple(value.shape)}")
+            rows = value.cpu().tolist()
+            return [row[:L] for row in rows]
+
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(f"Unsupported type for {name}: {type(value)!r}")
+        if len(value) != B:
+            if len(value) == B * L:
+                # Attempt to reshape a flattened list.
+                reshaped = [list(value[i * L:(i + 1) * L]) for i in range(B)]
+                return reshaped
+            raise ValueError(f"{name} list length {len(value)} does not match batch size {B}")
+
+        rows: List[List[Any]] = []
+        for row in value:
+            if isinstance(row, torch.Tensor):
+                row_list = row.cpu().tolist()
+            elif isinstance(row, (list, tuple)):
+                row_list = list(row)
+            elif row is None:
+                row_list = [None] * L
+            elif isinstance(row, str):
+                row_list = list(row)
+            else:
+                row_list = list(row)
+            if len(row_list) < L:
+                row_list = row_list + [None] * (L - len(row_list))
+            rows.append(row_list[:L])
+        return rows
+
+    def _normalize_chain_annotations(
+        self,
+        chain_ids: Sequence[Sequence[Any]] | torch.Tensor,
+        shape: Tuple[int, int],
+    ) -> List[List[Any]]:
+        rows = self._normalize_nested(chain_ids, shape, "chain_ids")
+        normalized: List[List[Any]] = []
+        for row in rows:
+            row_norm: List[Any] = []
+            for item in row:
+                if torch.is_tensor(item):  # type: ignore[truthy-bool]
+                    item = item.item() if item.numel() == 1 else item.tolist()
+                if isinstance(item, bytes):
+                    item = item.decode("utf-8")
+                if isinstance(item, str):
+                    trimmed = item.strip()
+                    row_norm.append(trimmed if trimmed else None)
+                else:
+                    row_norm.append(item)
+            normalized.append(row_norm)
+        return normalized
+
+    def _resolve_window_margin(self, override: int | None) -> int:
+        if override is None:
+            return self.chain_window_margin
+        return max(0, int(override))
+
+    def _collect_chain_records(
+        self,
+        aa: torch.Tensor,
+        mask: torch.Tensor,
+        chain_rows: List[List[Any]],
+        residue_rows: List[List[Any]] | None,
+        window_margin: int,
+    ) -> List[ChainRecord]:
+        records: List[ChainRecord] = []
+        B, _ = aa.shape
+        for b in range(B):
+            valid_idx = torch.nonzero(mask[b], as_tuple=False).squeeze(-1)
+            if valid_idx.numel() == 0:
+                continue
+            chain_row = chain_rows[b] if b < len(chain_rows) else None
+            if chain_row is None:
+                continue
+            residue_row = residue_rows[b] if residue_rows is not None and b < len(residue_rows) else None
+            groups: Dict[Any, List[Tuple[int, int]]] = defaultdict(list)
+            full_entries: Dict[Any, List[Tuple[int, int]]] = defaultdict(list)
+            row_length = len(chain_row)
+            for pos in range(row_length):
+                label_all = chain_row[pos]
+                if label_all is None:
+                    continue
+                if isinstance(label_all, torch.Tensor):
+                    label_all = label_all.item() if label_all.numel() == 1 else tuple(label_all.tolist())
+                res_full = residue_row[pos] if residue_row is not None and pos < len(residue_row) else pos
+                if isinstance(res_full, torch.Tensor):
+                    res_full = res_full.item() if res_full.numel() == 1 else tuple(res_full.tolist())
+                try:
+                    res_full_int = int(res_full)
+                except (TypeError, ValueError):
+                    res_full_int = pos
+                full_entries[label_all].append((res_full_int, pos))
+            for pos in valid_idx.tolist():
+                if pos >= row_length:
+                    continue
+                label = chain_row[pos]
+                if label is None:
+                    continue
+                if isinstance(label, torch.Tensor):
+                    label = label.item() if label.numel() == 1 else tuple(label.tolist())
+                if isinstance(label, str) and not label:
+                    continue
+                res_idx = residue_row[pos] if residue_row is not None and pos < len(residue_row) else pos
+                if isinstance(res_idx, torch.Tensor):
+                    res_idx = res_idx.item() if res_idx.numel() == 1 else tuple(res_idx.tolist())
+                try:
+                    res_idx_int = int(res_idx)
+                except (TypeError, ValueError):
+                    res_idx_int = pos
+                groups[label].append((res_idx_int, pos))
+            for label, entries in groups.items():
+                if not entries:
+                    continue
+                entries.sort(key=lambda item: (item[0], item[1]))
+                positions = [pos for _, pos in entries]
+                residue_indices = [res for res, _ in entries]
+                window_positions = positions.copy()
+                window_residue_indices = residue_indices.copy()
+                gather_indices = list(range(len(positions)))
+                if label in full_entries and full_entries[label]:
+                    full_list = sorted(full_entries[label], key=lambda item: (item[0], item[1]))
+                    selected = full_list
+                    if window_margin > 0 and residue_indices:
+                        min_res = min(residue_indices)
+                        max_res = max(residue_indices)
+                        lower = min_res - window_margin
+                        upper = max_res + window_margin
+                        filtered = [
+                            (res, pos_full)
+                            for res, pos_full in full_list
+                            if lower <= res <= upper
+                        ]
+                        if filtered:
+                            selected = filtered
+                    merged: Dict[int, int] = {pos_full: res_full for res_full, pos_full in selected}
+                    for res_orig, pos_orig in entries:
+                        merged[pos_orig] = res_orig
+                    combined = sorted(merged.items(), key=lambda item: (item[1], item[0]))
+                    window_positions = [pos for pos, _ in combined]
+                    window_residue_indices = [res for _, res in combined]
+                    pos_to_idx = {pos: idx for idx, pos in enumerate(window_positions)}
+                    gather_indices = [pos_to_idx[pos] for pos in positions]
+                records.append(
+                    ChainRecord(
+                        batch_idx=b,
+                        chain_label=label,
+                        positions=positions,
+                        residue_indices=residue_indices,
+                        window_positions=window_positions,
+                        window_residue_indices=window_residue_indices,
+                        gather_indices=gather_indices,
+                    )
+                )
+        return records
+
+    def _embed_sequences_for_records(
+        self,
+        key: str,
+        records: List[ChainRecord],
+        aa: torch.Tensor,
+        outputs: torch.Tensor,
+    ) -> torch.Tensor:
+        if not records:
+            return outputs
+        sequences: List[str] = []
+        owners: List[ChainRecord] = []
+        for record in records:
+            seq_positions = record.window_positions if record.window_positions else record.positions
+            seq_tensor = aa[record.batch_idx][seq_positions]
+            seq = tensor_to_sequence(seq_tensor)
+            if not seq:
+                continue
+            sequences.append(seq)
+            owners.append(record)
+        if not owners:
+            return outputs
+        embeddings = self.embed_batch(key, sequences)
+        for record, emb in zip(owners, embeddings):
+            seq_positions = record.window_positions if record.window_positions else record.positions
+            expected_len = len(seq_positions)
+            if emb.size(0) != expected_len:
+                raise RuntimeError(
+                    "Mismatch between chain embedding length "
+                    f"{emb.size(0)} and residue count {expected_len}",
+                )
+            gather_idx = record.gather_indices if record.gather_indices else list(range(expected_len))
+            gathered = emb[gather_idx]
+            if gathered.size(0) != len(record.positions):
+                raise RuntimeError(
+                    "Mismatch between gathered embedding length "
+                    f"{gathered.size(0)} and target positions {len(record.positions)}",
+                )
+            outputs[record.batch_idx, record.positions] = gathered
+        return outputs
+
+    def _embed_if1_chains(
+        self,
+        records: List[ChainRecord],
+        aa: torch.Tensor,
+        coords: torch.Tensor,
+        coord_mask: torch.Tensor,
+        outputs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, List[ChainRecord]]:
+        if not records:
+            return outputs, []
+        structure_payload: List[Tuple[ChainRecord, torch.Tensor, torch.Tensor]] = []
+        fallback: List[ChainRecord] = []
+        backbone_atoms = [
+            int(BBHeavyAtom.N),
+            int(BBHeavyAtom.CA),
+            int(BBHeavyAtom.C),
+            int(BBHeavyAtom.O),
+        ]
+        for record in records:
+            seq_positions = record.window_positions if record.window_positions else record.positions
+            coords_chain = coords[record.batch_idx][seq_positions]
+            coord_mask_chain = coord_mask[record.batch_idx][seq_positions]
+            if coords_chain.numel() == 0 or not coord_mask_chain.any():
+                fallback.append(record)
+                continue
+            structure_payload.append(
+                (
+                    record,
+                    coords_chain[:, backbone_atoms, :].float(),
+                    coord_mask_chain[:, backbone_atoms].bool(),
+                )
+            )
+
+        if structure_payload:
+            max_len = max(
+                len(record.window_positions) if record.window_positions else len(record.positions)
+                for record, _, _ in structure_payload
+            )
+            B = len(structure_payload)
+            aa_batch = torch.full((B, max_len), fill_value=0, dtype=aa.dtype)
+            mask_batch = torch.zeros((B, max_len), dtype=torch.bool)
+            coords_batch = torch.zeros((B, max_len, coords.size(2), coords.size(3)), dtype=coords.dtype)
+            coord_mask_batch = torch.zeros((B, max_len, coord_mask.size(2)), dtype=torch.bool)
+            for idx, (record, coords_chain, coord_mask_chain) in enumerate(structure_payload):
+                seq_positions = record.window_positions if record.window_positions else record.positions
+                L = len(seq_positions)
+                aa_batch[idx, :L] = aa[record.batch_idx][seq_positions]
+                mask_batch[idx, :L] = True
+                coords_batch[idx, :L] = coords_chain
+                coord_mask_batch[idx, :L] = coord_mask_chain
+            struct_outputs = torch.zeros(B, max_len, outputs.size(-1), dtype=torch.float32)
+            struct_embeddings = self._embed_if1_with_structure(
+                aa_batch,
+                mask_batch,
+                coords_batch,
+                coord_mask_batch,
+                struct_outputs,
+            )
+            for idx, (record, _, _) in enumerate(structure_payload):
+                seq_positions = record.window_positions if record.window_positions else record.positions
+                seq_len = len(seq_positions)
+                window_emb = struct_embeddings[idx, :seq_len]
+                gather_idx = record.gather_indices if record.gather_indices else list(range(seq_len))
+                patch_emb = window_emb[gather_idx]
+                if patch_emb.size(0) != len(record.positions):
+                    raise RuntimeError(
+                        "Structure-conditioned embeddings did not align with target positions",
+                    )
+                outputs[record.batch_idx, record.positions] = patch_emb
+
+        return outputs, fallback
+
+    def _embed_with_chain_split(
+        self,
+        key: str,
+        aa: torch.Tensor,
+        mask: torch.Tensor,
+        outputs: torch.Tensor,
+        chain_rows: List[List[Any]],
+        residue_rows: List[List[Any]] | None,
+        coords: torch.Tensor | None,
+        coord_mask: torch.Tensor | None,
+        window_margin: int,
+    ) -> torch.Tensor:
+        records = self._collect_chain_records(aa, mask, chain_rows, residue_rows, window_margin)
+        if not records:
+            return outputs
+
+        if key == "esm_if1" and coords is not None and coord_mask is not None:
+            outputs, fallback = self._embed_if1_chains(records, aa, coords, coord_mask, outputs)
+            if fallback:
+                outputs = self._embed_sequences_for_records(key, fallback, aa, outputs)
+            return outputs
+
+        return self._embed_sequences_for_records(key, records, aa, outputs)
+
+    def _embed_if1_with_structure(
+        self,
+        aa: torch.Tensor,
+        mask: torch.Tensor,
+        coords: torch.Tensor,
+        coord_mask: torch.Tensor,
+        outputs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run ESM-IF1 in structure-conditioned mode when coordinates are available."""
+
+        backbone_atoms = [
+            int(BBHeavyAtom.N),
+            int(BBHeavyAtom.CA),
+            int(BBHeavyAtom.C),
+            int(BBHeavyAtom.O),
+        ]
+
+        sequences: List[str] = []
+        owners: List[Tuple[int, torch.Tensor]] = []
+        coord_list: List[torch.Tensor] = []
+        confidence_list: List[torch.Tensor] = []
+        for b in range(aa.size(0)):
+            valid = mask[b]
+            if not torch.any(valid):
+                continue
+            seq = tensor_to_sequence(aa[b][valid])
+            if not seq:
+                continue
+            coords_b = coords[b][valid][:, backbone_atoms, :]
+            mask_b = coord_mask[b][valid][:, backbone_atoms]
+            if coords_b.numel() == 0 or not torch.any(mask_b):
+                continue
+            sequences.append(seq)
+            owners.append((b, valid))
+            coord_list.append(coords_b.float())
+            confidence_list.append(mask_b.float())
+
+        if not sequences:
+            return outputs
+
+        converter = self.batch_converters["esm_if1"]
+
+        batch_inputs = []
+        for idx, seq in enumerate(sequences):
+            batch_inputs.append(
+                (
+                    f"seq_{idx}",
+                    coord_list[idx],
+                    confidence_list[idx],
+                    seq,
+                )
+            )
+
+        try:
+            batch = converter(batch_inputs)
+        except TypeError:
+            # Some versions of fair-esm expect (label, seq, coords, confidence).
+            batch_inputs_alt = [
+                (f"seq_{idx}", seq, coord_list[idx], confidence_list[idx])
+                for idx, seq in enumerate(sequences)
+            ]
+            batch = converter(batch_inputs_alt)
+
+        if isinstance(batch, dict):
+            coords_batch = batch.get("coords")
+            confidence_batch = batch.get("confidence")
+            tokens = batch.get("tokens")
+            padding_mask = batch.get("padding_mask")
+            coord_batch_mask = batch.get("coord_mask")
+        else:
+            # Earlier releases return a tuple.
+            if len(batch) == 4:
+                coords_batch, confidence_batch, tokens, padding_mask = batch
+                coord_batch_mask = None
+            elif len(batch) == 5:
+                coords_batch, confidence_batch, tokens, padding_mask, coord_batch_mask = batch
+            else:  # pragma: no cover - compatibility shim
+                raise RuntimeError(
+                    "Unexpected return signature from CoordBatchConverter; "
+                    f"expected 4 or 5 elements, got {len(batch)}"
+                )
+
+        layer = self.model_layers["esm_if1"]
+        model = self.models["esm_if1"]
+
+        coords_batch = coords_batch.to(self.device)
+        tokens = tokens.to(self.device)
+        padding_mask = padding_mask.to(self.device)
+        if confidence_batch is not None:
+            confidence_batch = confidence_batch.to(self.device)
+        if coord_batch_mask is not None:
+            coord_batch_mask = coord_batch_mask.to(self.device)
+
+        kwargs = {
+            "tokens": tokens,
+            "coords": coords_batch,
+            "padding_mask": padding_mask,
+            "repr_layers": [layer],
+            "return_contacts": False,
+        }
+        if confidence_batch is not None:
+            kwargs["confidence"] = confidence_batch
+        if coord_batch_mask is not None:
+            kwargs["coord_mask"] = coord_batch_mask
+
+        with torch.no_grad():
+            try:
+                result = model(**kwargs)
+            except TypeError:
+                # Older checkpoints expect positional arguments.
+                args = [tokens, coords_batch, padding_mask]
+                if coord_batch_mask is not None:
+                    args.append(coord_batch_mask)
+                result = model(
+                    *args,
+                    repr_layers=[layer],
+                    return_contacts=False,
+                )
+
+        reps = result["representations"][layer].to(torch.float32).cpu()
+
+        for (b, valid), emb in zip(owners, reps):
+            length = int(valid.sum().item())
+            if emb.dim() != 2:
+                raise RuntimeError(
+                    f"Unexpected ESM-IF1 embedding shape {tuple(emb.shape)} for batch element"
+                )
+            if emb.size(0) == length + 1:
+                residue_emb = emb[1:length + 1]
+            else:
+                residue_emb = emb[:length]
+            if residue_emb.size(0) != length:
+                raise RuntimeError(
+                    "Mismatch between structure-conditioned embedding length "
+                    f"{residue_emb.size(0)} and valid residues {length}"
+                )
+            outputs[b, valid] = residue_emb
+
+        return outputs
+
+
+def add_esm_features_to_batch(
+    data: Dict[str, torch.Tensor],
+    mask: torch.Tensor,
+    extractor: ESMFeatureExtractor,
+    model_keys: Iterable[str],
+) -> None:
+    """Populate the given data dictionary with ESM features for each requested key."""
+    if extractor is None:
+        return
+    aa = data.get("aa")
+    if aa is None or aa.numel() == 0:
+        return
+    if mask is None:
+        raise ValueError("Mask tensor is required to compute ESM features")
+    mask_bool = mask.bool()
+    coords = data.get("pos_heavyatom")
+    coord_mask = data.get("mask_heavyatom")
+    chain_ids = data.get("chain_nb") if data.get("chain_nb") is not None else data.get("chain_id")
+    residue_index = data.get("res_nb") if data.get("res_nb") is not None else data.get("resseq")
+    for key in model_keys:
+        if key in data and isinstance(data[key], torch.Tensor):
+            # Already populated; skip.
+            continue
+        try:
+            embeddings = extractor.embed_batch_from_tensor(
+                aa,
+                mask_bool,
+                key,
+                coords=coords,
+                coord_mask=coord_mask,
+                chain_ids=chain_ids,
+                residue_index=residue_index,
+            )
+        except RuntimeError as exc:
+            LOGGER.warning("Failed to compute %s features: %s", key, exc)
+            continue
+        if embeddings.numel() == 0:
+            continue
+        data[key] = embeddings

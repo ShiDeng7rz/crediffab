@@ -1,5 +1,4 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,10 +9,6 @@ from diffab.datasets.AminoAcidVocab import _build_residue_tables, IDX2ATOM, IDX2
 from diffab.modules.encoders.pair import PairEmbedding
 from diffab.modules.encoders.residue import ResidueEmbedding
 from diffab.utils.protein.constants import max_num_heavyatoms, BBHeavyAtom
-
-# from data.pdb_utils import VOCAB
-# from models.egnn_clean import EGNN
-# from models.embeddings.position_embedding import SinusoidalPositionEmbedding
 
 LOGIT_MIN = math.log(1 / 100.0)  # 1/T ∈ [0.01, 100]
 LOGIT_MAX = math.log(100.0)
@@ -397,25 +392,7 @@ class ContrastiveLearningModel(nn.Module):
 
         z_graph = self.readout(h_embed, batch_id, cdr_mask)
 
-        # def _cos_all(x):
-        #     x = torch.nn.functional.normalize(x, dim=1)
-        #     M = x @ x.t()
-        #     diag = M.diag().mean().item()
-        #     off = (M.sum() - M.diag().sum()) / (M.numel() - M.size(0))
-        #     return diag, off.item()
-        #
-        # with torch.no_grad():
-        #     print('[0] h_embed stats:', h_embed.std(dim=0).mean().item(), _cos_all(h_embed))
-        #     print('[0] z_graph stats:', z_graph.std(dim=0).mean().item(), _cos_all(z_graph))
-        #     h1 = self.proj_head(z_graph - z_graph.mean(dim=0, keepdim=True))
-        #     print('[1] proj stats:', h1.std(dim=0).mean().item(), _cos_all(h1))
-        #
-        #     z = torch.nn.functional.normalize(h1, dim=1)
-        #     M = z @ z.t()
-        #     print('[4] final cos diag/off:', M.diag().mean().item(),
-        #           (M.sum() - M.diag().sum()) / (M.numel() - M.size(0)))
-
-        # 投影并归一化
+        # # 投影并归一化
         if is_antibody:
             z_proj = self.proj_head_ab(z_graph)
         else:
@@ -467,3 +444,16 @@ def info_nce_masked(z_ab, z_ag, temp, y_ab):
     S = S.masked_fill(mask, -1e9)
 
     return 0.5 * (F.cross_entropy(S, labels) + F.cross_entropy(S.t(), labels))
+
+
+def infonce_loss(z_ab, z_ag, temp=0.07):
+    z_ab = F.normalize(z_ab, dim=1)
+    z_ag = F.normalize(z_ag, dim=1)
+    logits = (z_ab @ z_ag.t()) / temp
+    labels = torch.arange(z_ab.size(0), device=z_ab.device)
+    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
+
+
+def pair_align_loss(z_ab, z_ag, w=1.0):
+    # 余弦直接拉拽（归一化后）
+    return w * (1 - F.cosine_similarity(z_ab, z_ag, dim=1)).mean()

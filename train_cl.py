@@ -1,8 +1,10 @@
 import argparse
 import pickle
 import shutil
+from typing import Tuple, Optional
 
 import faiss
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 import torch.utils.tensorboard
 from torch import optim
@@ -10,15 +12,18 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from cl_model.cl_model import ContrastiveLearningModel, LOGIT_MIN, LOGIT_MAX, info_nce_masked, supcon_samecluster
+from cl_model.cl_premodel import ContrastiveLearningModel, LOGIT_MIN, LOGIT_MAX, info_nce_masked, supcon_samecluster
 from diffab.datasets import get_dataset
 from diffab.models import get_model
 from diffab.utils.augment import build_two_views_pose_invariant
 from diffab.utils.data import *
+from diffab.utils.esm_feature import ESMFeatureExtractor, add_esm_features_to_batch
 from diffab.utils.misc import *
+from diffab.utils.protein.constants import BBHeavyAtom
 from diffab.utils.train import *
 from tools import unwrap
 
+mp.set_sharing_strategy('file_system')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -97,6 +102,99 @@ class XBM:
         return self.mem_ab[:self.size], self.mem_ag[:self.size]
 
 
+def _get_valid_mask(batch_dict: dict, fallback_key: str = 'mask_heavyatom') -> torch.Tensor:
+    if 'mask' in batch_dict:
+        return batch_dict['mask'].bool()
+    elif fallback_key in batch_dict:
+        return batch_dict[fallback_key].any(dim=-1)
+    raise KeyError('Cannot find valid residue mask in batch dictionary.')
+
+
+def compute_interface_masks(ab_batch: dict, ag_batch: dict, cutoff: float = 6.0) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = ab_batch['pos_heavyatom'].device
+    mask_ab = _get_valid_mask(ab_batch)
+    mask_ag = _get_valid_mask(ag_batch)
+    paratope = torch.zeros_like(mask_ab, dtype=torch.bool, device=device)
+    epitope = torch.zeros_like(mask_ag, dtype=torch.bool, device=device)
+    pos_ab = ab_batch['pos_heavyatom'][:, :, BBHeavyAtom.CA, :]
+    pos_ag = ag_batch['pos_heavyatom'][:, :, BBHeavyAtom.CA, :]
+    B = pos_ab.size(0)
+    for b in range(B):
+        m_ab = mask_ab[b]
+        m_ag = mask_ag[b]
+        if not m_ab.any() or not m_ag.any():
+            continue
+        pa = pos_ab[b][m_ab]
+        pg = pos_ag[b][m_ag]
+        dist = torch.cdist(pa, pg)
+        paratope[b, m_ab] = dist.min(dim=1).values <= cutoff
+        epitope[b, m_ag] = dist.min(dim=0).values <= cutoff
+    return paratope, epitope
+
+
+def normalize_surface_prior(prior: Optional[torch.Tensor], mask: torch.Tensor) -> torch.Tensor:
+    if prior is None:
+        return torch.zeros(mask.shape, dtype=torch.float32, device=mask.device)
+    prior = prior.clone().float()
+    out = torch.zeros_like(prior)
+    for b in range(prior.size(0)):
+        valid = mask[b]
+        if not valid.any():
+            continue
+        values = prior[b][valid]
+        max_val = values.max()
+        if torch.isfinite(max_val) and max_val > 0:
+            out[b, valid] = values / max_val
+    return out
+
+
+def assign_weak_labels(
+        ab_views: Tuple[dict, dict],
+        ag_views: Tuple[dict, dict],
+        paratope_mask: torch.Tensor,
+        epitope_mask: torch.Tensor,
+        surface_prior: torch.Tensor,
+) -> None:
+    for view in ab_views:
+        view['paratope_mask'] = paratope_mask.clone()
+    for view in ag_views:
+        view['epitope_mask'] = epitope_mask.clone()
+        view['surface_prior'] = surface_prior.clone()
+
+
+def bce_from_aux(aux: dict, key: str) -> torch.Tensor:
+    logits = aux.get(f'{key}_logits')
+    targets = aux.get(f'{key}_target')
+    if logits is None or targets is None or logits.numel() == 0:
+        if logits is not None:
+            return logits.new_tensor(0.0)
+        return torch.tensor(0.0, device=aux.get('node_embeddings', torch.tensor(0.0)).device)
+    targets = targets.float().to(logits.device)
+    return F.binary_cross_entropy_with_logits(logits, targets, reduction='mean')
+
+
+def _summarize_transforms(transform_cfg):
+    """Return a pair of (pretty_strings, canonical_tokens) for comparing configs."""
+    if not transform_cfg:
+        return [], []
+
+    readable, canonical = [], []
+    for item in transform_cfg:
+        if isinstance(item, dict):
+            name = item.get('type', str(item))
+            extras = {k: v for k, v in item.items() if k != 'type'}
+            if extras:
+                extras_str = ', '.join(f"{k}={extras[k]}" for k in sorted(extras))
+                readable.append(f"{name}({extras_str})")
+            else:
+                readable.append(str(name))
+            canonical.append((name, tuple(sorted(extras.items()))))
+        else:
+            readable.append(str(item))
+            canonical.append((str(item), ()))
+    return readable, canonical
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('config', type=str)
@@ -107,7 +205,7 @@ if __name__ == '__main__':
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--finetune', type=str, default=None)
-    parser.add_argument('--max_epoch', type=int, default=70)
+    parser.add_argument('--max_epoch', type=int, default=500)
     parser.add_argument('--is_train', type=int, default=0, help='train or save embeddings')
     parser.add_argument('--save_dir', type=str, default='./trained_models/retrieval')
     args = parser.parse_args()
@@ -135,17 +233,29 @@ if __name__ == '__main__':
             shutil.copyfile(args.config, os.path.join(log_dir, os.path.basename(args.config)))
     logger.info(args)
     logger.info(config)
-
+    train_tfm_readable, train_tfm_canonical = _summarize_transforms(getattr(config.dataset.train, 'transform', None))
+    val_tfm_readable, val_tfm_canonical = _summarize_transforms(getattr(config.dataset.val, 'transform', None))
+    if train_tfm_readable:
+        logger.info('Train transforms: %s', ' -> '.join(train_tfm_readable))
+    else:
+        logger.info('Train transforms: <none>')
+    if val_tfm_readable:
+        logger.info('Val transforms: %s', ' -> '.join(val_tfm_readable))
+    else:
+        logger.info('Val transforms: <none>')
+    if train_tfm_canonical != val_tfm_canonical:
+        logger.warning('Train/Val transforms differ. Retrieval quality can collapse if distributions mismatch.')
     # Data
     logger.info('Loading dataset...')
     train_dataset = get_dataset(config.dataset.train)
     val_dataset = get_dataset(config.dataset.val)
     train_loader = DataLoader(
         train_dataset,
-        batch_sampler=BalancedBatchSampler(
-            labels=train_dataset.cluster_id.tolist(),
-            n_clusters=5, n_per_cluster=4, drop_last=True
-        ),
+        # batch_sampler=BalancedBatchSampler(
+        #     labels=train_dataset.cluster_id.tolist(),
+        #     n_clusters=128, n_per_cluster=5, drop_last=True
+        # ),
+        batch_size=20,
         collate_fn=SplitPaddingCollate(),
         num_workers=args.num_workers,
         pin_memory=True,
@@ -182,13 +292,12 @@ if __name__ == '__main__':
         scheduler.load_state_dict(ckpt['scheduler'])
 
     # 实例化对比学习模型，定义损失函数与优化器
-    cl_model = ContrastiveLearningModel(input_node_dim=26, input_edge_dim=65, num_node_attr=6, device=args.device).to(
-        args.device)
+    cl_model = ContrastiveLearningModel(device=args.device).to(args.device)
     # 如果你需要 DDP 包装（训练用；纯推理可以不包）
     # 注意：仅在需要反向传播/训练时使用
 
     # diffuser = Diffuser(input_edge_dim=37, num_node_attr=25, device=device).to(device).to(device)
-    optimizer = optim.AdamW(cl_model.parameters(), lr=config.train.optimizer.lr)
+    optimizer = optim.AdamW(cl_model.parameters(), lr=config.train.optimizer.lr, weight_decay=0.0)
     grad_accum_steps = max(1, int(getattr(args, "grad_accum_steps", 1)))
     steps_per_epoch = math.ceil(len(train_loader) / max(1, grad_accum_steps))
     total_steps = args.max_epoch * steps_per_epoch
@@ -210,12 +319,26 @@ if __name__ == '__main__':
     xbm = None  # 训练开始后用实际维度初始化
     best_score = 0
     best_tie = (0, 0, 0)
+    temperature = getattr(cl_model, 'temperature', 0.25)
+    supcon_weight = 0.1
+    paratope_weight = 0.2
+    epitope_weight = 0.2
+    warmup_epochs = 5
+    esm_device = (
+        args.device
+        if isinstance(args.device, str) and args.device.startswith('cuda') and torch.cuda.is_available()
+        else 'cpu'
+    )
+    esm_extractor = ESMFeatureExtractor(device=esm_device, max_batch_size=getattr(args, 'esm_batch_size', 4))
     # 开始训练
     if args.is_train == 0:
         for epoch in range(args.max_epoch):
 
             cl_model.train()  # 设置模型为训练模式
             total_loss, total_seen = 0.0, 0
+            cur_supcon = supcon_weight if epoch >= warmup_epochs else 0.0
+            cur_paratope_w = paratope_weight if epoch >= warmup_epochs else 0.0
+            cur_epitope_w = epitope_weight if epoch >= warmup_epochs else 0.0
             # tqdm 直接包装 train_loader
             loop = tqdm(
                 train_loader,
@@ -224,17 +347,16 @@ if __name__ == '__main__':
                 leave=False
             )
             optimizer.zero_grad(set_to_none=True)
-            for step_idx, batch in enumerate(loop, start=1):
+            for step_idx, batch in enumerate(loop, start=0):
 
                 ag_data, ab_data = batch['antigen'], batch['antibody']
                 y_ab = torch.tensor([train_dataset.cluster_name_to_int.get(name, -1) for name in ab_data['cluster']],
                                     dtype=torch.long, device=args.device)
-                # 如果 collate 对 antibody/antigen 分别做了排序/打包，可能需要从它们内部字段取各自的 id：
-                pid_ab = ab_data['batch_indices']
-                pid_ag = ag_data['batch_indices']
 
-                assert torch.equal(pid_ab, pid_ag), \
-                    f"Pair IDs misaligned after collate: ab={pid_ab[:8]} ag={pid_ag[:8]}"
+                mask_ag_cpu = _get_valid_mask(ag_data)
+                mask_ab_cpu = _get_valid_mask(ab_data)
+                add_esm_features_to_batch(ab_data, mask_ab_cpu, esm_extractor, ('esm_if1', 'esm2', 'esm'))
+                add_esm_features_to_batch(ag_data, mask_ag_cpu, esm_extractor, ('esm2', 'esm_if1', 'esm'))
 
                 # 可以做数据增强
                 ag_data = recursive_to(ag_data, args.device)
@@ -243,51 +365,24 @@ if __name__ == '__main__':
                     ab_data, ag_data,
                     atom_drop_p=0.00, edge_drop_p=0.00, jitter_std=0.02
                 )
-
+                paratope_mask, epitope_mask = compute_interface_masks(ab_data, ag_data)
+                surface_prior = normalize_surface_prior(ag_data.get('sasa'), _get_valid_mask(ag_data))
                 with autocast('cuda', dtype=autocast_dtype, enabled=use_amp):
-                    z_ab_1, _ = cl_model(ab_v1, True)
-                    z_ag_1, _ = cl_model(ag_v1, False)
-                    z_ab_2, _ = cl_model(ab_v2, True)
-                    z_ag_2, _ = cl_model(ag_v2, False)
+                    z_ab_1, _, aux_ab_1 = cl_model(ab_v1, True)
+                    z_ag_1, _, aux_ag_1 = cl_model(ag_v1, False)
+                    z_ab_2, _, aux_ab_2 = cl_model(ab_v2, True)
+                    z_ag_2, _, aux_ag_2 = cl_model(ag_v2, False)
 
-                    # 初始化 XBM
-                    if use_xbm and (xbm is None):
-                        xbm = XBM(dim=z_ab_1.size(1), capacity=max(8000, 8 * z_ab_1.size(0)), device=args.device)
+                    loss_1 = info_nce_masked(z_ab_1, z_ag_1, temp=temperature, y_ab=y_ab)
+                    loss_2 = info_nce_masked(z_ab_2, z_ag_2, temp=temperature, y_ab=y_ab)
+                    if cur_supcon > 0.0:
+                        loss_1 = loss_1 + cur_supcon * supcon_samecluster(z_ab_1, y_ab, temp=temperature)
+                        loss_2 = loss_2 + cur_supcon * supcon_samecluster(z_ab_2, y_ab, temp=temperature)
 
-                    # 拼接队列负样本（可显著提升小batch对比学习）
-                    if use_xbm and xbm.size > 0:
+                    paratope_loss = 0.5 * (bce_from_aux(aux_ab_1, 'paratope') + bce_from_aux(aux_ab_2, 'paratope'))
+                    epitope_loss = 0.5 * (bce_from_aux(aux_ag_1, 'epitope') + bce_from_aux(aux_ag_2, 'epitope'))
 
-                        mem_ab, mem_ag = xbm.get()  # [M, D]
-
-                    else:
-                        mem_ab, mem_ag = None, None
-
-
-                    def _contrastive_with_mem(z_ab, z_ag, logit_scale=None):
-                        z_ab = torch.nn.functional.normalize(z_ab, dim=1)
-                        z_ag = torch.nn.functional.normalize(z_ag, dim=1)
-                        if logit_scale is None:
-                            # 固定温度（先把温度学习关掉，稳定再打开）
-                            logit_scale = torch.tensor(math.log(1 / 0.07), device=z_ab.device)
-                        s = z_ab @ z_ag.t()  # [B, B]
-                        ls = torch.exp(logit_scale).clamp(1e-3, 1e3)
-                        logits_ab = ls * s
-                        logits_ag = ls * s.t()
-                        labels = torch.arange(z_ab.size(0), device=z_ab.device)
-                        loss = 0.5 * (
-                                torch.nn.functional.cross_entropy(logits_ab, labels) +
-                                torch.nn.functional.cross_entropy(logits_ag, labels)
-                        )
-                        return loss
-
-
-                    loss_1 = info_nce_masked(z_ab_1, z_ag_1, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_1,
-                                                                                                              y_ab,
-                                                                                                              temp=0.07)
-                    loss_2 = info_nce_masked(z_ab_2, z_ag_2, temp=0.07, y_ab=y_ab) + 0.2 * supcon_samecluster(z_ab_2,
-                                                                                                              y_ab,
-                                                                                                              temp=0.07)
-                    loss_raw = 0.5 * (loss_1 + loss_2)
+                    loss_raw = 0.5 * (loss_1 + loss_2) + cur_paratope_w * paratope_loss + cur_epitope_w * epitope_loss
                     for n, p in unwrap(cl_model).named_parameters():
                         if "logit_scale" in n:
                             p.requires_grad_(False)
@@ -311,20 +406,11 @@ if __name__ == '__main__':
                     with torch.no_grad():
                         unwrap(cl_model).logit_scale.clamp_(LOGIT_MIN, LOGIT_MAX)
 
-                    # 更新 XBM（放在一步完成后）
-                    if use_xbm:
-                        with torch.no_grad():
-                            xbm.enqueue(
-                                torch.nn.functional.normalize(z_ab_1.detach(), dim=1),
-                                torch.nn.functional.normalize(z_ag_1.detach(), dim=1)
-                            )
-
                 bs = z_ab_1.size(0)
                 total_loss += float(loss_raw.detach().item()) * bs
                 total_seen += bs
-
             avg_loss = total_loss / max(total_seen, 1)
-            tqdm.write("Epoch %d train loss %.6f" % (epoch + 1, avg_loss))
+            print("Epoch %d train loss %.6f" % (epoch + 1, avg_loss))
 
 
             #######验证########
@@ -344,8 +430,8 @@ if __name__ == '__main__':
                     # 记录簇标签（顺序与 z_ab 对齐）
                     y_chunks.append(ab['cluster'])
 
-                    z_ab, _ = model(ab, True)
-                    z_ag, _ = model(ag, False)
+                    z_ab, _, _ = model(ab, True)
+                    z_ag, _, _ = model(ag, False)
 
                     zs_ab.append(z_ab)
                     zs_ag.append(z_ag)
@@ -359,7 +445,32 @@ if __name__ == '__main__':
                     [train_dataset.cluster_name_to_int.get(n, -1) for n in flat_names],
                     dtype=torch.long, device=device
                 )
+                with torch.no_grad():
+                    # 余弦相似
+                    Sab = z_ab @ z_ag.t()
+                    Saa = z_ab @ z_ab.t()
+                    Sgg = z_ag @ z_ag.t()
 
+                    N = Sab.size(0)
+                    eye = torch.eye(N, device=Sab.device, dtype=torch.bool)
+
+                    # 统计正样本 vs 最强负样本
+                    diag = Sab.diag()
+                    offmax = Sab.masked_fill(eye, -1e9).max(dim=1).values
+                    print(
+                        f"[check] ab-ag diag mean={diag.mean():.3f} | offmax mean={offmax.mean():.3f} | ratio={(diag > offmax).float().mean():.3f}")
+
+                    # 看“各自空间是否分得开”（如同类粘在一起但跨模态对不上）
+                    offmax_aa = Saa.masked_fill(eye, -1e9).max(dim=1).values
+                    offmax_gg = Sgg.masked_fill(eye, -1e9).max(dim=1).values
+                    print(
+                        f"[check] ab-ab self offmax mean={offmax_aa.mean():.3f} | ag-ag self offmax mean={offmax_gg.mean():.3f}")
+
+                    # 2) 最近邻是否总是落在同簇（说明簇标签比配对还“强”）
+                    # y_ab: [N] 的 cluster id
+                    nn_idx = Sab.argmax(dim=1)  # 每个 ab 最近的 ag
+                    hit_same_cluster = (y_ab == y_ab[nn_idx]).float().mean().item()
+                    print(f"[check] nearest ag shares cluster with ab: {hit_same_cluster:.3f}")
                 # 相似度矩阵（对角即正样本）
                 S = z_ab @ z_ag.t()
                 N = S.size(0)
@@ -390,8 +501,10 @@ if __name__ == '__main__':
                 # 可选：评估期监控损失（不反传）
                 mask = (y_ab >= 0)
                 if mask.any():
-                    val_loss = info_nce_masked(z_ab[mask], z_ag[mask], temp=0.07, y_ab=y_ab[mask]) \
-                               + 0.2 * supcon_samecluster(z_ab[mask], y_ab[mask], temp=0.07)
+                    val_loss = info_nce_masked(z_ab[mask], z_ag[mask], temp=temperature, y_ab=y_ab[mask])
+                    if supcon_weight > 0.0:
+                        val_loss = val_loss + supcon_weight * supcon_samecluster(z_ab[mask], y_ab[mask],
+                                                                                 temp=temperature)
                 else:
                     val_loss = torch.tensor(float('nan'), device=device)
                 N = S.size(0)
@@ -434,8 +547,6 @@ if __name__ == '__main__':
                 best_score, best_tie = score, tie
                 torch.save(unwrap(cl_model).state_dict(), best_path)  # 原权重
                 print(f"模型已保存至: {best_path}")
-
-
 
     else:
 
