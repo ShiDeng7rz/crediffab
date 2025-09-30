@@ -232,9 +232,16 @@ class AntibodyLanguageModelExtractor:
                 seq_positions = record.window_positions if record.window_positions else record.positions
                 expected_len = len(seq_positions)
                 if emb.size(0) != expected_len:
-                    raise RuntimeError(
-                        f"Embedding length {emb.size(0)} does not match expected residues {expected_len}"
-                    )
+                    if emb.size(0) - expected_len in (1, 2):
+                        # Prefer trimming from both sides when two extra tokens are present; for
+                        # a single token, drop the leading element to align with the residue order.
+                        start = 1 if emb.size(0) - expected_len >= 1 else 0
+                        end = emb.size(0) - 1 if emb.size(0) - expected_len == 2 else emb.size(0)
+                        emb = emb[start:end]
+                    if emb.size(0) != expected_len:
+                        raise RuntimeError(
+                            f"Embedding length {emb.size(0)} does not match expected residues {expected_len}"
+                        )
                 gather_idx = record.gather_indices if record.gather_indices else list(range(expected_len))
                 gathered = emb[gather_idx]
                 if gathered.size(0) != len(record.positions):
@@ -264,10 +271,16 @@ class AntibodyLanguageModelExtractor:
         dim = embeddings[0].size(-1)
         outputs = torch.zeros(B, L, dim, dtype=torch.float32)
         for (b, valid), emb in zip(owners, embeddings):
-            if emb.size(0) != int(valid.sum().item()):
-                raise RuntimeError(
-                    f"Embedding length {emb.size(0)} does not match valid residue count {int(valid.sum().item())}"
-                )
+            expected_len = int(valid.sum().item())
+            if emb.size(0) != expected_len:
+                if emb.size(0) - expected_len in (1, 2):
+                    start = 1 if emb.size(0) - expected_len >= 1 else 0
+                    end = emb.size(0) - 1 if emb.size(0) - expected_len == 2 else emb.size(0)
+                    emb = emb[start:end]
+                if emb.size(0) != expected_len:
+                    raise RuntimeError(
+                        f"Embedding length {emb.size(0)} does not match valid residue count {expected_len}"
+                    )
             outputs[b, valid] = emb.to(torch.float32)
         return outputs
 
