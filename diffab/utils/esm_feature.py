@@ -6,7 +6,6 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 import torch
 
 from diffab.datasets.AminoAcidVocab import ORDERED_SYMBOLS
-from diffab.utils.protein.constants import BBHeavyAtom
 
 LOGGER = logging.getLogger(__name__)
 
@@ -70,6 +69,7 @@ class ESMFeatureExtractor:
         self.models: Dict[str, torch.nn.Module] = {}
         self.alphabets = {}
         self.batch_converters = {}
+        self.coord_batch_converters: Dict[str, Any] = {}
         self.model_layers: Dict[str, int] = {}
         self.model_dims: Dict[str, int] = {}
         self.cache: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
@@ -157,7 +157,33 @@ class ESMFeatureExtractor:
 
         self.models[key] = model
         self.alphabets[key] = alphabet
-        self.batch_converters[key] = alphabet.get_batch_converter()
+        batch_converter = alphabet.get_batch_converter()
+        self.batch_converters[key] = batch_converter
+
+        coord_converter: Any | None = None
+        if key == "esm_if1":
+            try:  # pragma: no cover - optional dependency path
+                from esm.inverse_folding.util import CoordBatchConverter  # type: ignore
+            except (ImportError, AttributeError):
+                LOGGER.warning(
+                    "ESM-IF1 coordinate batch converter unavailable; falling back to sequence-only batches.",
+                )
+            else:
+                constructor_attempts = (
+                    lambda: CoordBatchConverter(alphabet),
+                    lambda: CoordBatchConverter(alphabet, device=self.device),
+                )
+                for build in constructor_attempts:
+                    try:
+                        coord_converter = build()
+                        break
+                    except TypeError:
+                        continue
+                if coord_converter is None:
+                    LOGGER.warning(
+                        "Unable to instantiate ESM-IF1 CoordBatchConverter; structure features will be skipped.",
+                    )
+        self.coord_batch_converters[key] = coord_converter
         self.model_layers[key] = int(layer)
         self.model_dims[key] = int(dim)
 
@@ -261,21 +287,6 @@ class ESMFeatureExtractor:
                 coord_mask_cpu,
                 margin,
             )
-
-        if key == "esm_if1" and coords is not None and coord_mask is not None:
-            try:
-                return self._embed_if1_with_structure(
-                    aa_cpu,
-                    mask_cpu,
-                    coords_cpu,
-                    coord_mask_cpu,
-                    outputs,
-                )
-            except Exception as exc:  # pragma: no cover - defensive fallback
-                LOGGER.warning(
-                    "Falling back to sequence-only embeddings for esm_if1 due to error: %s",
-                    exc,
-                )
 
         sequences: List[str] = []
         owners: List[Tuple[int, torch.Tensor]] = []
@@ -508,73 +519,6 @@ class ESMFeatureExtractor:
             outputs[record.batch_idx, record.positions] = gathered
         return outputs
 
-    def _embed_if1_chains(
-            self,
-            records: List[ChainRecord],
-            aa: torch.Tensor,
-            coords: torch.Tensor,
-            coord_mask: torch.Tensor,
-            outputs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, List[ChainRecord]]:
-        if not records:
-            return outputs, []
-        structure_payload: List[Tuple[ChainRecord, torch.Tensor, torch.Tensor]] = []
-        fallback: List[ChainRecord] = []
-
-        for record in records:
-            seq_positions = record.window_positions if record.window_positions else record.positions
-            coords_chain = coords[record.batch_idx][seq_positions]
-            coord_mask_chain = coord_mask[record.batch_idx][seq_positions]
-            if coords_chain.numel() == 0 or not coord_mask_chain.any():
-                fallback.append(record)
-                continue
-            structure_payload.append(
-                (
-                    record,
-                    coords_chain.float(),
-                    coord_mask_chain.bool(),
-                )
-            )
-
-        if structure_payload:
-            max_len = max(
-                len(record.window_positions) if record.window_positions else len(record.positions)
-                for record, _, _ in structure_payload
-            )
-            B = len(structure_payload)
-            aa_batch = torch.full((B, max_len), fill_value=0, dtype=aa.dtype)
-            mask_batch = torch.zeros((B, max_len), dtype=torch.bool)
-            coords_batch = torch.zeros((B, max_len, coords.size(2), coords.size(3)), dtype=coords.dtype)
-            coord_mask_batch = torch.zeros((B, max_len, coord_mask.size(2)), dtype=torch.bool)
-            for idx, (record, coords_chain, coord_mask_chain) in enumerate(structure_payload):
-                seq_positions = record.window_positions if record.window_positions else record.positions
-                L = len(seq_positions)
-                aa_batch[idx, :L] = aa[record.batch_idx][seq_positions]
-                mask_batch[idx, :L] = True
-                coords_batch[idx, :L] = coords_chain
-                coord_mask_batch[idx, :L] = coord_mask_chain
-            struct_outputs = torch.zeros(B, max_len, outputs.size(-1), dtype=torch.float32)
-            struct_embeddings = self._embed_if1_with_structure(
-                aa_batch,
-                mask_batch,
-                coords_batch,
-                coord_mask_batch,
-                struct_outputs,
-            )
-            for idx, (record, _, _) in enumerate(structure_payload):
-                seq_positions = record.window_positions if record.window_positions else record.positions
-                seq_len = len(seq_positions)
-                window_emb = struct_embeddings[idx, :seq_len]
-                gather_idx = record.gather_indices if record.gather_indices else list(range(seq_len))
-                patch_emb = window_emb[gather_idx]
-                if patch_emb.size(0) != len(record.positions):
-                    raise RuntimeError(
-                        "Structure-conditioned embeddings did not align with target positions",
-                    )
-                outputs[record.batch_idx, record.positions] = patch_emb
-
-        return outputs, fallback
-
     def _embed_with_chain_split(
             self,
             key: str,
@@ -591,156 +535,7 @@ class ESMFeatureExtractor:
         if not records:
             return outputs
 
-        if key == "esm_if1" and coords is not None and coord_mask is not None:
-            outputs, fallback = self._embed_if1_chains(records, aa, coords, coord_mask, outputs)
-            if fallback:
-                outputs = self._embed_sequences_for_records(key, fallback, aa, outputs)
-            return outputs
-
         return self._embed_sequences_for_records(key, records, aa, outputs)
-
-    def _embed_if1_with_structure(
-            self,
-            aa: torch.Tensor,
-            mask: torch.Tensor,
-            coords: torch.Tensor,
-            coord_mask: torch.Tensor,
-            outputs: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run ESM-IF1 in structure-conditioned mode when coordinates are available."""
-
-        sequences: List[str] = []
-        owners: List[Tuple[int, torch.Tensor]] = []
-        coord_list: List[torch.Tensor] = []
-        confidence_list: List[torch.Tensor] = []
-        for b in range(aa.size(0)):
-            valid = mask[b]
-            if not torch.any(valid):
-                continue
-            seq = tensor_to_sequence(aa[b][valid])
-            if not seq:
-                continue
-            coords_b = coords[b][valid]
-            mask_b = coord_mask[b][valid]
-            if coords_b.dim() != 3 or coords_b.size(-1) != 3:
-                raise RuntimeError(
-                    "ESM-IF1 coordinates must have shape [L, A, 3]; "
-                    f"received {tuple(coords_b.shape)}"
-                )
-            if mask_b.dim() != 2 or mask_b.size(0) != coords_b.size(0):
-                raise RuntimeError(
-                    "ESM-IF1 coordinate mask must align with coordinates; "
-                    f"received mask shape {tuple(mask_b.shape)} for coords {tuple(coords_b.shape)}"
-                )
-            if coords_b.numel() == 0 or not torch.any(mask_b):
-                continue
-            sequences.append(seq)
-            owners.append((b, valid))
-            coord_list.append(coords_b.float())
-            confidence_list.append(mask_b.float())
-
-        if not sequences:
-            return outputs
-
-        converter = self.batch_converters["esm_if1"]
-
-        batch_inputs = []
-        for idx, seq in enumerate(sequences):
-            batch_inputs.append(
-                (
-                    f"seq_{idx}",
-                    coord_list[idx],
-                    confidence_list[idx],
-                    seq,
-                )
-            )
-
-        try:
-            batch = converter(batch_inputs)
-        except TypeError:
-            # Some versions of fair-esm expect (label, seq, coords, confidence).
-            batch_inputs_alt = [
-                (f"seq_{idx}", seq, coord_list[idx], confidence_list[idx])
-                for idx, seq in enumerate(sequences)
-            ]
-            batch = converter(batch_inputs_alt)
-
-        if isinstance(batch, dict):
-            coords_batch = batch.get("coords")
-            confidence_batch = batch.get("confidence")
-            tokens = batch.get("tokens")
-            padding_mask = batch.get("padding_mask")
-            coord_batch_mask = batch.get("coord_mask")
-        else:
-            # Earlier releases return a tuple.
-            if len(batch) == 4:
-                coords_batch, confidence_batch, tokens, padding_mask = batch
-                coord_batch_mask = None
-            elif len(batch) == 5:
-                coords_batch, confidence_batch, tokens, padding_mask, coord_batch_mask = batch
-            else:  # pragma: no cover - compatibility shim
-                raise RuntimeError(
-                    "Unexpected return signature from CoordBatchConverter; "
-                    f"expected 4 or 5 elements, got {len(batch)}"
-                )
-
-        layer = self.model_layers["esm_if1"]
-        model = self.models["esm_if1"]
-
-        coords_batch = coords_batch.to(self.device)
-        tokens = tokens.to(self.device)
-        padding_mask = padding_mask.to(self.device)
-        if confidence_batch is not None:
-            confidence_batch = confidence_batch.to(self.device)
-        if coord_batch_mask is not None:
-            coord_batch_mask = coord_batch_mask.to(self.device)
-
-        kwargs = {
-            "tokens": tokens,
-            "coords": coords_batch,
-            "padding_mask": padding_mask,
-            "repr_layers": [layer],
-            "return_contacts": False,
-        }
-        if confidence_batch is not None:
-            kwargs["confidence"] = confidence_batch
-        if coord_batch_mask is not None:
-            kwargs["coord_mask"] = coord_batch_mask
-
-        with torch.no_grad():
-            try:
-                result = model(**kwargs)
-            except TypeError:
-                # Older checkpoints expect positional arguments.
-                args = [tokens, coords_batch, padding_mask]
-                if coord_batch_mask is not None:
-                    args.append(coord_batch_mask)
-                result = model(
-                    *args,
-                    repr_layers=[layer],
-                    return_contacts=False,
-                )
-
-        reps = result["representations"][layer].to(torch.float32).cpu()
-
-        for (b, valid), emb in zip(owners, reps):
-            length = int(valid.sum().item())
-            if emb.dim() != 2:
-                raise RuntimeError(
-                    f"Unexpected ESM-IF1 embedding shape {tuple(emb.shape)} for batch element"
-                )
-            if emb.size(0) == length + 1:
-                residue_emb = emb[1:length + 1]
-            else:
-                residue_emb = emb[:length]
-            if residue_emb.size(0) != length:
-                raise RuntimeError(
-                    "Mismatch between structure-conditioned embedding length "
-                    f"{residue_emb.size(0)} and valid residues {length}"
-                )
-            outputs[b, valid] = residue_emb
-
-        return outputs
 
 
 def add_esm_features_to_batch(

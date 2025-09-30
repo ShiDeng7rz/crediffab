@@ -355,8 +355,8 @@ if __name__ == '__main__':
 
                 mask_ag_cpu = _get_valid_mask(ag_data)
                 mask_ab_cpu = _get_valid_mask(ab_data)
-                add_esm_features_to_batch(ab_data, mask_ab_cpu, esm_extractor, ('esm_if1', 'esm2', 'esm'))
-                add_esm_features_to_batch(ag_data, mask_ag_cpu, esm_extractor, ('esm2', 'esm_if1', 'esm'))
+                add_esm_features_to_batch(ab_data, mask_ab_cpu, esm_extractor, ('esm2',))
+                add_esm_features_to_batch(ag_data, mask_ag_cpu, esm_extractor, ('esm2',))
 
                 # 可以做数据增强
                 ag_data = recursive_to(ag_data, args.device)
@@ -421,8 +421,14 @@ if __name__ == '__main__':
                 y_chunks = []
 
                 for batch in val_loader:
-                    ab = recursive_to(batch['antibody'], device)
-                    ag = recursive_to(batch['antigen'], device)
+                    ab_dict = batch['antibody']
+                    ag_dict = batch['antigen']
+                    add_esm_features_to_batch(ab_dict, _get_valid_mask(ab_dict), esm_extractor,
+                                              ('esm2',))
+                    add_esm_features_to_batch(ag_dict, _get_valid_mask(ag_dict), esm_extractor,
+                                              ('esm2',))
+                    ab = recursive_to(ab_dict, device)
+                    ag = recursive_to(ag_dict, device)
 
                     # 批内对齐检查（局部索引）
                     assert torch.equal(ab['batch_indices'], ag['batch_indices'])
