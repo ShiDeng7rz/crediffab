@@ -1,5 +1,5 @@
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
@@ -54,11 +54,11 @@ class ESMFeatureExtractor:
     }
 
     def __init__(
-        self,
-        device: str | torch.device = "cpu",
-        dtype: torch.dtype = torch.float32,
-        max_batch_size: int = 4,
-        chain_window_margin: int | None = 64,
+            self,
+            device: str | torch.device = "cpu",
+            dtype: torch.dtype = torch.float32,
+            max_batch_size: int = 4,
+            chain_window_margin: int | None = 64,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
@@ -73,6 +73,51 @@ class ESMFeatureExtractor:
         self.model_layers: Dict[str, int] = {}
         self.model_dims: Dict[str, int] = {}
         self.cache: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
+
+    def _find_model_attribute(
+            self,
+            model: torch.nn.Module,
+            attribute_names: Sequence[str],
+            module_attributes: Sequence[str] = ("encoder", "esm", "model", "backbone", "trunk"),
+    ) -> Any | None:
+        """Search ``model`` and common nested modules for a given attribute.
+
+        Some ESM wrappers (notably ``esm_if1``) expose metadata such as ``num_layers``
+        or ``embed_dim`` on a nested module instead of the top-level instance.  This
+        helper walks a small set of known attribute names to locate the information
+        without hard-coding per-model logic.
+        """
+
+        queue: deque[Any] = deque([model])
+        visited: set[int] = set()
+        while queue:
+            current = queue.popleft()
+            identifier = id(current)
+            if identifier in visited:
+                continue
+            visited.add(identifier)
+            for attr in attribute_names:
+                value = getattr(current, attr, None)
+                if value is not None:
+                    return value
+                # Some models expose hyper-parameters through an ``args`` or ``config``
+                # attribute (e.g., ``model.args.embed_dim``).  Check both mapping-like
+                # and attribute-style containers as part of the search.
+                for container_name in ("args", "config"):
+                    container = getattr(current, container_name, None)
+                    if container is None:
+                        continue
+                    if isinstance(container, dict):
+                        if attr in container and container[attr] is not None:
+                            return container[attr]
+                    else:
+                        value = getattr(container, attr, None)
+                        if value is not None:
+                            return value
+            for child_name in module_attributes:
+                if hasattr(current, child_name):
+                    queue.append(getattr(current, child_name))
+        return None
 
     def _ensure_model(self, key: str) -> None:
         if key in self.models:
@@ -103,12 +148,10 @@ class ESMFeatureExtractor:
         for param in model.parameters():
             param.requires_grad_(False)
 
-        layer = getattr(model, "num_layers", None)
+        layer = self._find_model_attribute(model, ("num_layers",))
         if layer is None:
             raise RuntimeError(f"Unable to infer number of layers for ESM model '{key}'")
-        dim = getattr(model, "embed_dim", None)
-        if dim is None:
-            dim = getattr(model, "embedding_dim", None)
+        dim = self._find_model_attribute(model, ("embed_dim", "embedding_dim", "hidden_dim", "encoder_embed_dim"))
         if dim is None:
             raise RuntimeError(f"Unable to infer embedding dimension for ESM model '{key}'")
 
@@ -155,15 +198,15 @@ class ESMFeatureExtractor:
         return [tensor.contiguous() for tensor in outputs]  # type: ignore[arg-type]
 
     def embed_batch_from_tensor(
-        self,
-        aa: torch.Tensor,
-        mask: torch.Tensor,
-        key: str,
-        coords: torch.Tensor | None = None,
-        coord_mask: torch.Tensor | None = None,
-        chain_ids: Sequence[Sequence[Any]] | torch.Tensor | None = None,
-        residue_index: Sequence[Sequence[Any]] | torch.Tensor | None = None,
-        chain_window_margin: int | None = None,
+            self,
+            aa: torch.Tensor,
+            mask: torch.Tensor,
+            key: str,
+            coords: torch.Tensor | None = None,
+            coord_mask: torch.Tensor | None = None,
+            chain_ids: Sequence[Sequence[Any]] | torch.Tensor | None = None,
+            residue_index: Sequence[Sequence[Any]] | torch.Tensor | None = None,
+            chain_window_margin: int | None = None,
     ) -> torch.Tensor:
         """Compute per-residue embeddings for a batch of padded tensors.
 
@@ -258,10 +301,10 @@ class ESMFeatureExtractor:
         return outputs
 
     def _normalize_nested(
-        self,
-        value: Sequence[Sequence[Any]] | torch.Tensor,
-        shape: Tuple[int, int],
-        name: str,
+            self,
+            value: Sequence[Sequence[Any]] | torch.Tensor,
+            shape: Tuple[int, int],
+            name: str,
     ) -> List[List[Any]]:
         B, L = shape
         if isinstance(value, torch.Tensor):
@@ -301,9 +344,9 @@ class ESMFeatureExtractor:
         return rows
 
     def _normalize_chain_annotations(
-        self,
-        chain_ids: Sequence[Sequence[Any]] | torch.Tensor,
-        shape: Tuple[int, int],
+            self,
+            chain_ids: Sequence[Sequence[Any]] | torch.Tensor,
+            shape: Tuple[int, int],
     ) -> List[List[Any]]:
         rows = self._normalize_nested(chain_ids, shape, "chain_ids")
         normalized: List[List[Any]] = []
@@ -328,12 +371,12 @@ class ESMFeatureExtractor:
         return max(0, int(override))
 
     def _collect_chain_records(
-        self,
-        aa: torch.Tensor,
-        mask: torch.Tensor,
-        chain_rows: List[List[Any]],
-        residue_rows: List[List[Any]] | None,
-        window_margin: int,
+            self,
+            aa: torch.Tensor,
+            mask: torch.Tensor,
+            chain_rows: List[List[Any]],
+            residue_rows: List[List[Any]] | None,
+            window_margin: int,
     ) -> List[ChainRecord]:
         records: List[ChainRecord] = []
         B, _ = aa.shape
@@ -426,11 +469,11 @@ class ESMFeatureExtractor:
         return records
 
     def _embed_sequences_for_records(
-        self,
-        key: str,
-        records: List[ChainRecord],
-        aa: torch.Tensor,
-        outputs: torch.Tensor,
+            self,
+            key: str,
+            records: List[ChainRecord],
+            aa: torch.Tensor,
+            outputs: torch.Tensor,
     ) -> torch.Tensor:
         if not records:
             return outputs
@@ -466,23 +509,18 @@ class ESMFeatureExtractor:
         return outputs
 
     def _embed_if1_chains(
-        self,
-        records: List[ChainRecord],
-        aa: torch.Tensor,
-        coords: torch.Tensor,
-        coord_mask: torch.Tensor,
-        outputs: torch.Tensor,
+            self,
+            records: List[ChainRecord],
+            aa: torch.Tensor,
+            coords: torch.Tensor,
+            coord_mask: torch.Tensor,
+            outputs: torch.Tensor,
     ) -> Tuple[torch.Tensor, List[ChainRecord]]:
         if not records:
             return outputs, []
         structure_payload: List[Tuple[ChainRecord, torch.Tensor, torch.Tensor]] = []
         fallback: List[ChainRecord] = []
-        backbone_atoms = [
-            int(BBHeavyAtom.N),
-            int(BBHeavyAtom.CA),
-            int(BBHeavyAtom.C),
-            int(BBHeavyAtom.O),
-        ]
+
         for record in records:
             seq_positions = record.window_positions if record.window_positions else record.positions
             coords_chain = coords[record.batch_idx][seq_positions]
@@ -493,8 +531,8 @@ class ESMFeatureExtractor:
             structure_payload.append(
                 (
                     record,
-                    coords_chain[:, backbone_atoms, :].float(),
-                    coord_mask_chain[:, backbone_atoms].bool(),
+                    coords_chain.float(),
+                    coord_mask_chain.bool(),
                 )
             )
 
@@ -538,16 +576,16 @@ class ESMFeatureExtractor:
         return outputs, fallback
 
     def _embed_with_chain_split(
-        self,
-        key: str,
-        aa: torch.Tensor,
-        mask: torch.Tensor,
-        outputs: torch.Tensor,
-        chain_rows: List[List[Any]],
-        residue_rows: List[List[Any]] | None,
-        coords: torch.Tensor | None,
-        coord_mask: torch.Tensor | None,
-        window_margin: int,
+            self,
+            key: str,
+            aa: torch.Tensor,
+            mask: torch.Tensor,
+            outputs: torch.Tensor,
+            chain_rows: List[List[Any]],
+            residue_rows: List[List[Any]] | None,
+            coords: torch.Tensor | None,
+            coord_mask: torch.Tensor | None,
+            window_margin: int,
     ) -> torch.Tensor:
         records = self._collect_chain_records(aa, mask, chain_rows, residue_rows, window_margin)
         if not records:
@@ -562,21 +600,14 @@ class ESMFeatureExtractor:
         return self._embed_sequences_for_records(key, records, aa, outputs)
 
     def _embed_if1_with_structure(
-        self,
-        aa: torch.Tensor,
-        mask: torch.Tensor,
-        coords: torch.Tensor,
-        coord_mask: torch.Tensor,
-        outputs: torch.Tensor,
+            self,
+            aa: torch.Tensor,
+            mask: torch.Tensor,
+            coords: torch.Tensor,
+            coord_mask: torch.Tensor,
+            outputs: torch.Tensor,
     ) -> torch.Tensor:
         """Run ESM-IF1 in structure-conditioned mode when coordinates are available."""
-
-        backbone_atoms = [
-            int(BBHeavyAtom.N),
-            int(BBHeavyAtom.CA),
-            int(BBHeavyAtom.C),
-            int(BBHeavyAtom.O),
-        ]
 
         sequences: List[str] = []
         owners: List[Tuple[int, torch.Tensor]] = []
@@ -589,8 +620,18 @@ class ESMFeatureExtractor:
             seq = tensor_to_sequence(aa[b][valid])
             if not seq:
                 continue
-            coords_b = coords[b][valid][:, backbone_atoms, :]
-            mask_b = coord_mask[b][valid][:, backbone_atoms]
+            coords_b = coords[b][valid]
+            mask_b = coord_mask[b][valid]
+            if coords_b.dim() != 3 or coords_b.size(-1) != 3:
+                raise RuntimeError(
+                    "ESM-IF1 coordinates must have shape [L, A, 3]; "
+                    f"received {tuple(coords_b.shape)}"
+                )
+            if mask_b.dim() != 2 or mask_b.size(0) != coords_b.size(0):
+                raise RuntimeError(
+                    "ESM-IF1 coordinate mask must align with coordinates; "
+                    f"received mask shape {tuple(mask_b.shape)} for coords {tuple(coords_b.shape)}"
+                )
             if coords_b.numel() == 0 or not torch.any(mask_b):
                 continue
             sequences.append(seq)
@@ -703,10 +744,10 @@ class ESMFeatureExtractor:
 
 
 def add_esm_features_to_batch(
-    data: Dict[str, torch.Tensor],
-    mask: torch.Tensor,
-    extractor: ESMFeatureExtractor,
-    model_keys: Iterable[str],
+        data: Dict[str, torch.Tensor],
+        mask: torch.Tensor,
+        extractor: ESMFeatureExtractor,
+        model_keys: Iterable[str],
 ) -> None:
     """Populate the given data dictionary with ESM features for each requested key."""
     if extractor is None:
