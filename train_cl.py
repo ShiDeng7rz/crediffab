@@ -260,7 +260,7 @@ if __name__ == '__main__':
         #     labels=train_dataset.cluster_id.tolist(),
         #     n_clusters=128, n_per_cluster=5, drop_last=True
         # ),
-        batch_size=512,
+        batch_size=128,
         collate_fn=SplitPaddingCollate(),
         num_workers=args.num_workers,
         pin_memory=True,
