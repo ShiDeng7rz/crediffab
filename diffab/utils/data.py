@@ -143,7 +143,7 @@ class SplitPaddingCollate(object):
 
         # 键集合（排除边）
         keys = self._get_common_keys(group_list)
-        edge_keys = {"edges", "edge_index"}
+        edge_keys = {"edges", "edge_index", "seq_md5"}
         keys_core = [k for k in keys if k not in edge_keys]
 
         # === 收集边（保持 list，不进入 default_collate）===
@@ -195,7 +195,7 @@ class SplitPaddingCollate(object):
 
         # 边以列表形式附上（不会被 default_collate 触发 stack）
         batch['edges'] = edges_list
-
+        batch['seq_md5'] = [d.get('seq_md5')for d in group_list]
         return batch
 
     def __call__(self, data_list):
@@ -223,12 +223,6 @@ class SplitPaddingCollate(object):
 
         ab_batch = self._collate_group(ab_items)
         ag_batch = self._collate_group(ag_items)
-
-        # 可选：记录映射关系，方便回溯（若不需要可去掉）
-        if ab_batch is not None:
-            ab_batch['batch_indices'] = torch.tensor(ab_indices, dtype=torch.long)
-        if ag_batch is not None:
-            ag_batch['batch_indices'] = torch.tensor(ag_indices, dtype=torch.long)
 
         max_length = max([data[self.length_ref_key].size(0) for data in complex_items])
         keys = self._get_common_keys(complex_items)

@@ -1,6 +1,6 @@
 model:
   type: diffab
-  res_feat_dim: 128
+  res_feat_dim: 256
   pair_feat_dim: 64
   diffusion:
     num_steps: 100
@@ -34,7 +34,7 @@ train:
 dataset:
   train:
     type: sabdab
-    summary_path: ./data/sabdab_summary_all.tsv
+    summary_path: ./data/sabdab_summary_all_.tsv
     chothia_dir: ./data/all_structures/chothia
     processed_dir: ./data/processed_com
     split: train
@@ -43,10 +43,10 @@ dataset:
       selection: CDR3
     - type: split_chains
 #    - type: patch_around_anchor
-#    - type: patch_cdr_epitope
+    - type: patch_cdr_epitope
   val:
     type: sabdab
-    summary_path: ./data/sabdab_summary_all.tsv
+    summary_path: ./data/sabdab_summary_all_.tsv
     chothia_dir: ./data/all_structures/chothia
     processed_dir: ./data/processed_com
     split: val
@@ -55,10 +55,10 @@ dataset:
       selection: CDR3
     - type: split_chains
 #    - type: patch_around_anchor
-#    - type: patch_cdr_epitope
+    - type: patch_cdr_epitope
   save_emb:
     type: sabdab
-    summary_path: ./data/sabdab_summary_all.tsv
+    summary_path: ./data/sabdab_summary_all_.tsv
     chothia_dir: ./data/all_structures/chothia
     processed_dir: ./data/processed_com
     split: save_emb

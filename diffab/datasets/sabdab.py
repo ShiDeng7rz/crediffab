@@ -4,6 +4,8 @@ import os
 import pickle
 import random
 import subprocess
+from collections import defaultdict
+from hashlib import md5
 
 import joblib
 import lmdb
@@ -17,6 +19,7 @@ from tqdm.auto import tqdm
 
 from diffab.datasets._base import register_dataset
 from diffab.utils.protein import parsers, constants
+from diffab.utils.protein.constants import aa_id_to_letter
 
 ALLOWED_AG_TYPES = {
     'protein',
@@ -134,6 +137,29 @@ def _label_light_chain_cdr(data, seq_map, max_cdr3_length=30):
     return data, seq_map
 
 
+def _chains_seq_and_local_map(data, seq_map):
+    # 聚合：同一 chain 的全体残基（按你 data 的顺序）
+    per_chain = defaultdict(lambda: {"letters": [], "glob_idx": []})
+    aa_list = data.aa.tolist()
+    for i, ch in enumerate(data.chain_id):
+        per_chain[ch]["letters"].append(aa_id_to_letter(int(aa_list[i])))
+        per_chain[ch]["glob_idx"].append(i)
+
+    results = {}  # chain_id -> dict(seq, md5, local_map)
+    for ch, obj in per_chain.items():
+        seq = "".join(obj["letters"])
+        seq_md5 = md5(seq.encode()).hexdigest()
+        # 构造 (chain_id, resseq, icode) -> (md5, local_idx)
+        local_map = {}
+        for local_idx, glob_i in enumerate(obj["glob_idx"]):
+            key = (data.chain_id[glob_i],
+                   int(data.resseq[glob_i]),
+                   str(data.icode[glob_i]))
+            local_map[key] = (seq_md5, local_idx)
+        results[ch] = {"seq": seq, "md5": seq_md5, "local_map": local_map}
+    return results
+
+
 def preprocess_sabdab_structure(task):
     entry = task['entry']
     pdb_path = task['pdb_path']
@@ -163,6 +189,13 @@ def preprocess_sabdab_structure(task):
                 model[entry['H_chain']],
                 max_resseq=113  # Chothia, end of Heavy chain Fv
             ))
+            if parsed["heavy"] is not None:
+                h = _chains_seq_and_local_map(parsed["heavy"], parsed["heavy_seqmap"])
+                # heavy 只有 1 条链，取你传入的 entry['H_chain'] 这条
+                cid = entry["H_chain"]
+                parsed["heavy_seq"] = h[cid]["seq"]
+                parsed["heavy_md5"] = h[cid]["md5"]
+                parsed["heavy_local_map"] = h[cid]["local_map"]
 
         if entry['L_chain'] is not None:
             (
@@ -172,6 +205,12 @@ def preprocess_sabdab_structure(task):
                 model[entry['L_chain']],
                 max_resseq=106  # Chothia, end of Light chain Fv
             ))
+            if parsed["light"] is not None:
+                l = _chains_seq_and_local_map(parsed["light"], parsed["light_seqmap"])
+                cid = entry["L_chain"]
+                parsed["light_seq"] = l[cid]["seq"]
+                parsed["light_md5"] = l[cid]["md5"]
+                parsed["light_local_map"] = l[cid]["local_map"]
 
         if parsed['heavy'] is None and parsed['light'] is None:
             raise ValueError('Neither valid H-chain or L-chain is found.')
@@ -182,6 +221,18 @@ def preprocess_sabdab_structure(task):
                 parsed['antigen'],
                 parsed['antigen_seqmap']
             ) = parsers.parse_biopython_structure(chains)
+            if parsed["antigen"] is not None:
+                ag = _chains_seq_and_local_map(parsed["antigen"], parsed["antigen_seqmap"])
+                # 把多条抗原链展开为并行列表，和你之前在画布里给的 builder 对齐
+                parsed["antigen_chain_ids"] = []
+                parsed["antigen_seqs"] = []
+                parsed["antigen_md5s"] = []
+                parsed["antigen_local_maps"] = []
+                for cid in sorted(ag.keys()):
+                    parsed["antigen_chain_ids"].append(cid)
+                    parsed["antigen_seqs"].append(ag[cid]["seq"])
+                    parsed["antigen_md5s"].append(ag[cid]["md5"])
+                    parsed["antigen_local_maps"].append(ag[cid]["local_map"])
         else:
             raise ValueError('No antigen chain is found.')
     except (
@@ -205,7 +256,7 @@ class SAbDabDataset(Dataset):
 
     def __init__(
             self,
-            summary_path='./data/sabdab_summary_all.tsv',
+            summary_path='./data/sabdab_summary_all_.tsv',
             chothia_dir='./data/all_structures/chothia',
             processed_dir='./data/processed',
             split='train',
@@ -412,9 +463,9 @@ class SAbDabDataset(Dataset):
         if split == 'test':
             self.ids_in_split = ids_test
         elif split == 'val':
-            self.ids_in_split = ids_train_val[:250]
+            self.ids_in_split = ids_train_val[500:550]
         elif split == 'train':
-            self.ids_in_split = ids_train_val[250:]
+            self.ids_in_split = ids_train_val[:500]
         else:
             self.ids_in_split = ids_train_val[:]
 

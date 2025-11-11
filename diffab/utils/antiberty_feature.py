@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import inspect
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
@@ -61,6 +63,7 @@ class AntibodyLanguageModelExtractor:
             max_batch_size: int = 4,
             model_dir: str | None = None,
             chain_window_margin: int | None = None,
+            cache_dir: str | Path | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
@@ -72,6 +75,40 @@ class AntibodyLanguageModelExtractor:
             self.chain_window_margin = max(0, int(chain_window_margin))
         self.runners: Dict[str, Any] = {}
         self.cache: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
+        self.cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else None
+        if self.cache_dir is not None:
+            (self.cache_dir / "antiberty").mkdir(parents=True, exist_ok=True)
+
+    def _cache_path(self, key: str, sequence: str) -> Path:
+        if self.cache_dir is None:
+            raise RuntimeError("Disk cache directory is not configured")
+        digest = hashlib.sha1(sequence.encode("utf-8")).hexdigest()
+        return self.cache_dir / key / f"{digest}.pt"
+
+    def _load_from_disk_cache(self, key: str, sequence: str) -> torch.Tensor | None:
+        if self.cache_dir is None:
+            return None
+        path = self._cache_path(key, sequence)
+        if not path.exists():
+            return None
+        try:
+            tensor = torch.load(path, map_location="cpu")
+        except Exception:
+            return None
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        return tensor.detach().clone()
+
+    def _save_to_disk_cache(self, key: str, sequence: str, tensor: torch.Tensor) -> None:
+        if self.cache_dir is None:
+            return
+        path = self._cache_path(key, sequence)
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            torch.save(tensor.detach().cpu(), path)
+        except Exception:
+            pass
 
     def _ensure_runner(self, key: str) -> None:
         if key in self.runners:
@@ -160,7 +197,14 @@ class AntibodyLanguageModelExtractor:
         if not sequences:
             return []
         cache = self.cache[key]
-        outputs: List[torch.Tensor | None] = [cache.get(seq) for seq in sequences]
+        outputs: List[torch.Tensor | None] = []
+        for seq in sequences:
+            cached = cache.get(seq)
+            if cached is None:
+                cached = self._load_from_disk_cache(key, seq)
+                if cached is not None:
+                    cache[seq] = cached
+            outputs.append(cached)
         missing: List[Tuple[int, str]] = [
             (idx, seq) for idx, (seq, cached) in enumerate(zip(sequences, outputs)) if cached is None
         ]
@@ -176,6 +220,7 @@ class AntibodyLanguageModelExtractor:
             for (idx, seq), emb in zip(missing, new_embeddings):
                 cache[seq] = emb
                 outputs[idx] = emb
+                self._save_to_disk_cache(key, seq, emb)
         return [out.clone() for out in outputs if out is not None]
 
     def _resolve_window_margin(self, override: int | None) -> int:
@@ -476,3 +521,5 @@ def _collect_chain_records(
                 )
             )
     return records
+
+

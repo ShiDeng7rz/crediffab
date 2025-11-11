@@ -117,6 +117,19 @@ ressymb_to_resindex = {
     'S': 15, 'T': 16, 'V': 17, 'W': 18, 'Y': 19,
     'X': 20,
 }
+_index_to_ressymb = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y',
+                     'X']
+
+
+def aa_id_to_letter(idx: int) -> str:
+    """单个索引 → 单字母；越界返回 'X'。"""
+    try:
+        i = int(idx)
+    except Exception:
+        return 'X'
+    if 0 <= i < len(_index_to_ressymb):
+        return _index_to_ressymb[i]
+    return 'X'
 
 
 class AA(enum.IntEnum):

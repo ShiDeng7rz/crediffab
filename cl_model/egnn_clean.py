@@ -149,15 +149,15 @@ class EGNN(nn.Module):
                                   normalize=normalize, tanh=tanh))
         self.to(self.device)
 
-    def forward(self, h, x, edges, edge_attr):
-        h = self.embedding_in(h)
+    def forward(self, h0, x, edges, edge_attr):
+        h = self.embedding_in(h0)
         # 对初始边特征进行编码
         edge_attr = self.edge_encoder(edge_attr)
         for i in range(0, self.n_layers):
             h, x, edge_attr = self._modules["gcl_%d" % i](h, edges, x, edge_attr=edge_attr)
-        h = self.embedding_out(h)
+        h1 = self.embedding_out(h)
         edge_attr = self.edge_out(edge_attr)
-        return h, x, edge_attr
+        return h1, x, edge_attr
 
 
 def unsorted_segment_sum(data, segment_ids, num_segments):

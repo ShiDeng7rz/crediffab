@@ -34,7 +34,7 @@ train:
 dataset:
   train:
     type: sabdab
-    summary_path: ./data/sabdab_summary_all.tsv
+    summary_path: ./data/sabdab_summary_all_.tsv
     chothia_dir: ./data/all_structures/chothia
     processed_dir: ./data/processed
     split: train
@@ -44,7 +44,7 @@ dataset:
     - type: patch_around_anchor
   val:
     type: sabdab
-    summary_path: ./data/sabdab_summary_all.tsv
+    summary_path: ./data/sabdab_summary_all_.tsv
     chothia_dir: ./data/all_structures/chothia
     processed_dir: ./data/processed
     split: val

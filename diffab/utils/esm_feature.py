@@ -1,6 +1,8 @@
+import hashlib
 import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
@@ -58,6 +60,7 @@ class ESMFeatureExtractor:
             dtype: torch.dtype = torch.float32,
             max_batch_size: int = 4,
             chain_window_margin: int | None = 64,
+            cache_dir: str | Path | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
@@ -73,6 +76,40 @@ class ESMFeatureExtractor:
         self.model_layers: Dict[str, int] = {}
         self.model_dims: Dict[str, int] = {}
         self.cache: Dict[str, Dict[str, torch.Tensor]] = defaultdict(dict)
+        self.cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _cache_path(self, key: str, sequence: str) -> Path:
+        if self.cache_dir is None:
+            raise RuntimeError("Disk cache directory is not configured")
+        digest = hashlib.sha1(sequence.encode("utf-8")).hexdigest()
+        return self.cache_dir / key / f"{digest}.pt"
+
+    def _load_from_disk_cache(self, key: str, sequence: str) -> torch.Tensor | None:
+        if self.cache_dir is None:
+            return None
+        path = self._cache_path(key, sequence)
+        if not path.exists():
+            return None
+        try:
+            tensor = torch.load(path, map_location="cpu")
+        except Exception:
+            return None
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        return tensor.detach().clone()
+
+    def _save_to_disk_cache(self, key: str, sequence: str, tensor: torch.Tensor) -> None:
+        if self.cache_dir is None:
+            return
+        path = self._cache_path(key, sequence)
+        if not path.parent.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            torch.save(tensor.detach().cpu(), path)
+        except Exception:
+            pass
 
     def _find_model_attribute(
             self,
@@ -195,7 +232,15 @@ class ESMFeatureExtractor:
         if not sequences:
             return []
         self._ensure_model(key)
-        outputs: List[torch.Tensor | None] = [self.cache[key].get(seq) for seq in sequences]
+        cache = self.cache[key]
+        outputs: List[torch.Tensor | None] = []
+        for seq in sequences:
+            cached = cache.get(seq)
+            if cached is None:
+                cached = self._load_from_disk_cache(key, seq)
+                if cached is not None:
+                    cache[seq] = cached
+            outputs.append(cached)
         missing: List[Tuple[int, str]] = [
             (idx, seq) for idx, (seq, cached) in enumerate(zip(sequences, outputs)) if cached is None
         ]
@@ -219,8 +264,9 @@ class ESMFeatureExtractor:
                 for row, (out_idx, seq) in enumerate(chunk):
                     length = len(seq)
                     emb = reps[row, 1:length + 1].contiguous()
-                    self.cache[key][seq] = emb
+                    cache[seq] = emb
                     outputs[out_idx] = emb
+                    self._save_to_disk_cache(key, seq, emb)
         return [tensor.contiguous() for tensor in outputs]  # type: ignore[arg-type]
 
     def embed_batch_from_tensor(

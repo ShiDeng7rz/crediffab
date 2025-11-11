@@ -73,141 +73,6 @@ class PatchAroundAnchor(object):
         return data_patch
 
 
-def _generate_graph_edges(
-        X,  # [N, A, 3] 所有原子坐标
-        tags,  # [N]       链/类型标签（例如: 0=heavy,1=light,3=antigen）
-        mask,  # [N, A]    原子有效掩码
-        *,
-        ca_index=1,  # Cα 在 A 维的索引；按你项目里的常量替换
-        c1=4.5,  # 同链半径阈值（Å）
-        c2=6.0,  # 跨链半径阈值（Å）
-        c3=2.0,  # 序列相邻阈值（Å）
-        k_intra=48,  # 同链每点最多保留邻居数
-        k_inter=32,  # 跨链每点最多保留邻居数
-        bidir=True,  # 是否复制反向边
-):
-    """
-    返回:
-        edge_index: LongTensor [2, E]
-    说明:
-        - 只用代表性坐标（默认 Cα）来近似残基间距离，极大降低计算和显存。
-        - 每个节点按同链/跨链各自做 top-k，边数受控 -> 避免 OOM。
-        - 默认不复制反向边（bidir=False）；如模型需要双向，设 True。
-    """
-    device = X.device
-    N, A, _ = X.shape
-    tags = tags.to(device)
-    mask = mask.to(device)
-
-    # 1) 代表性坐标：优先取 Cα；若该残基 Cα 缺失，用该残基第一颗有效原子兜底
-    #    （避免因缺 Cα 产生 NaN）
-    has_ca = mask[:, ca_index] if ca_index is not None else torch.zeros(N, dtype=torch.bool, device=device)
-    if ca_index is not None:
-        x_rep = X[:, ca_index]  # [N,3]
-    else:
-        x_rep = X[:, 0]  # 万一不给 index，就先取第 0 个
-
-    # 如果 Cα 缺失，用第一个有效原子顶上
-    if has_ca.any().item() is False or (~has_ca).any().item():
-        # 找每个残基第一个有效原子下标
-        # idx_first_valid[i] = 该残基第一个 True 的原子位置，否则 0
-        idx_first_valid = torch.argmax(mask.float(), dim=1)  # 没有 True 时返回 0，但下面再用 has_any 过滤
-        has_any = mask.any(dim=1)
-        x_fallback = X[torch.arange(N, device=device), idx_first_valid]  # [N,3]
-        x_rep = torch.where(has_ca[:, None], x_rep, x_fallback)
-        # 对完全无原子的残基，直接屏蔽（后续不连边）
-        valid_node = has_any
-    else:
-        valid_node = has_ca  # 至少有 Cα
-
-    # 如果全是无效残基
-    if valid_node.sum() <= 1:
-        return torch.empty(2, 0, dtype=torch.long, device=device)
-
-    # 2) 计算代表点两两距离 (N x N)
-    #    注意：用 torch.cdist 比你之前的 (N,N,14,14) 好得多
-    xv = x_rep
-    D = torch.cdist(xv, xv, p=2)  # [N,N]
-
-    # 3) 构造序列相邻边（非抗原 & 同链 & 距离<=c3）
-    idx = torch.arange(N - 1, device=device)
-    # 非抗原掩码（保留你原来的规则）
-
-    same_chain_adj = (tags[:-1] == tags[1:])
-    adj_ok = same_chain_adj & (D[idx, idx + 1] <= c3)
-    i_seq = idx[adj_ok]
-    seq_edges = torch.stack([i_seq, i_seq + 1], dim=0)  # [2, E_seq]
-    if bidir:
-        seq_edges = torch.cat([seq_edges, seq_edges.flip(0)], dim=1)
-
-    # 4) 同链近邻：每个 i 选 <=k_intra 个最近的同链邻居（不含自己）且距离<=c1
-    tags_i = tags.unsqueeze(1)  # [N,1]
-    tags_j = tags.unsqueeze(0)  # [1,N]
-    same_chain = (tags_i == tags_j)  # [N,N]
-    # 有效节点才参与
-    valid_mask_row = valid_node.unsqueeze(1)  # [N,1]
-    valid_mask_col = valid_node.unsqueeze(0)  # [1,N]
-    intra_mask = same_chain & valid_mask_row & valid_mask_col
-    # 排除对角线
-    intra_mask.fill_diagonal_(False)
-    # 半径约束
-    intra_mask = intra_mask & (D <= c1)
-
-    # 对每一行做 top-k（把无效位置置 +inf，再 topk 最小 k 个）
-    # 注意：若有效邻居少于 k_intra，topk 会返回全体；我们再过滤 inf
-    D_intra = D.clone()
-    D_intra[~intra_mask] = float('+inf')
-    # 为了拿到最小 k 个，把负号取反：取 topk(-D)
-    k_intra = min(k_intra, N - 1)
-    vals_i, idxs_i = torch.topk(-D_intra, k=k_intra, dim=1)  # [N,k]
-    # 过滤掉 inf（即原来是无效位置）
-    keep_i = (vals_i != float('-inf'))
-    # 构造 (src,dst)
-    src_i = torch.arange(N, device=device).unsqueeze(1).expand_as(idxs_i)[keep_i]
-    dst_i = idxs_i[keep_i]
-    intra_edges = torch.stack([src_i, dst_i], dim=0)
-    if bidir:
-        intra_edges = torch.cat([intra_edges, intra_edges.flip(0)], dim=1)
-
-    # 5) 跨链近邻：每个 i 选 <=k_inter 个最近的跨链邻居且距离<=c2
-    inter_mask = (~same_chain) & valid_mask_row & valid_mask_col & (D <= c2)
-    D_inter = D.clone()
-    D_inter[~inter_mask] = float('+inf')
-    k_inter = min(k_inter, N)
-    vals_e, idxs_e = torch.topk(-D_inter, k=k_inter, dim=1)
-    keep_e = (vals_e != float('-inf'))
-    src_e = torch.arange(N, device=device).unsqueeze(1).expand_as(idxs_e)[keep_e]
-    dst_e = idxs_e[keep_e]
-    inter_edges = torch.stack([src_e, dst_e], dim=0)
-    if bidir:
-        inter_edges = torch.cat([inter_edges, inter_edges.flip(0)], dim=1)
-
-    # 6) 合并并去重
-    edge_index = torch.cat([seq_edges, intra_edges, inter_edges], dim=1)  # [2, E]
-    # 去掉自环（双保险）
-    self_loop = edge_index[0] == edge_index[1]
-    if self_loop.any():
-        edge_index = edge_index[:, ~self_loop]
-
-    # 去重（对无向图：只保留 src<dst；若 bidir=True，可先做无向去重、再复制反向）
-    if not bidir:
-        # 把 (i,j) 和 (j,i) 统一为 (min,max) 后 uniq
-        u = torch.minimum(edge_index[0], edge_index[1])
-        v = torch.maximum(edge_index[0], edge_index[1])
-        uv = torch.stack([u, v], dim=0)
-        # unique 需要转置到 [E,2]
-        uv2 = uv.t().contiguous()
-        uv2 = torch.unique(uv2, dim=0)
-        edge_index = uv2.t().contiguous()
-    else:
-        # bidir: 用 unique 去重精确相等的重复边
-        ei2 = edge_index.t().contiguous()
-        ei2 = torch.unique(ei2, dim=0)
-        edge_index = ei2.t().contiguous()
-
-    return edge_index
-
-
 def _compute_residue_representatives(pos_atoms, mask_atoms):
     """Return per-residue representative coordinates and validity mask."""
     ca_index = constants.BBHeavyAtom.CA
@@ -263,7 +128,7 @@ def compute_interface_masks_complex(complex_data, distance_threshold=8.0):
     dist = torch.cdist(pos_ab, pos_ag)
 
     contact_ab = (dist.min(dim=1).values <= distance_threshold)
-    contact_ag = (dist.min(dim=0).values <= distance_threshold)
+    contact_ag = (dist.min(dim=0).values <= distance_threshold + 4)
 
     paratope_indices = torch.where(valid_ab)[0]
     epitope_indices = torch.where(valid_ag)[0]
@@ -273,28 +138,127 @@ def compute_interface_masks_complex(complex_data, distance_threshold=8.0):
     return paratope_mask, epitope_mask
 
 
+def span_fill_by_chain(mask: torch.Tensor, chain_nb: torch.Tensor) -> torch.Tensor:
+    """
+    在每条链内，把该链上第一个 True 到最后一个 True 之间全部置 True。
+    mask: [N]  布尔
+    chain_nb: [N]  记录每个残基属于哪条链（你的约定里 1=重链，2=轻链 等）
+    """
+    out = mask.clone()
+    for c in torch.unique(chain_nb).tolist():
+        idx = torch.nonzero(chain_nb == c, as_tuple=False).squeeze(1)  # 当前链的全局位置
+        if idx.numel() == 0:
+            continue
+        m = mask[idx]  # 当前链的局部掩码
+        pos = torch.nonzero(m, as_tuple=False).squeeze(1)
+        if pos.numel() >= 2:
+            lo = int(pos.min().item())
+            hi = int(pos.max().item())
+            m[lo:hi + 1] = True
+            out[idx] = m
+        # pos.numel()==0 或 ==1 的情况保持原样（如需可再做±w的膨胀）
+    return out
+
+
+def _residue_reps(pos_atoms: torch.Tensor, mask_atoms: torch.Tensor, ca_index: int):
+    """每残基取一个代表点（优先 CA，缺失则取该残基第一个有效原子）。"""
+    N = pos_atoms.size(0)
+    has_any = mask_atoms.any(dim=1)
+    if ca_index < mask_atoms.size(1):
+        has_ca = mask_atoms[:, ca_index]
+        pos_rep = pos_atoms[:, ca_index]
+    else:
+        has_ca = torch.zeros_like(has_any)
+        pos_rep = pos_atoms.new_zeros((N, 3))
+    idx_first = torch.argmax(mask_atoms.float(), dim=1)
+    fallback = pos_atoms[torch.arange(N, device=pos_atoms.device), idx_first]
+    pos_rep = torch.where(has_ca[:, None], pos_rep, fallback)
+    pos_rep = torch.where(has_any[:, None], pos_rep, torch.zeros_like(pos_rep))
+    return pos_rep, has_any
+
+
+def _ctx_by_radius_simple(pos_rep: torch.Tensor, valid: torch.Tensor,
+                          core_mask: torch.Tensor, radius: float) -> torch.Tensor:
+    """距核心≤radius 且非核心的作为上下文。"""
+    device = pos_rep.device
+    N = pos_rep.size(0)
+    ctx = torch.zeros(N, dtype=torch.bool, device=device)
+    if not (valid.any() and core_mask.any()):
+        return ctx
+    v_idx = torch.where(valid)[0]
+    c_idx = torch.where(valid & core_mask)[0]
+    if c_idx.numel() == 0:
+        return ctx
+    P = pos_rep[v_idx]  # [Nv,3]
+    C = pos_rep[c_idx]  # [Nc,3]
+    d = torch.cdist(P, C)  # [Nv,Nc]
+    near = (d.min(dim=1).values <= radius)  # [Nv]
+    near_idx = v_idx[near]
+    # 去掉核心自身
+    near_idx = near_idx[~core_mask[near_idx]]
+    ctx[near_idx] = True
+    return ctx
+
+
 @register_transform('patch_cdr_epitope')
 class PatchCDREpitope(object):
-
-    def __init__(self, initial_patch_size=128, antigen_size=128):
+    def __init__(self, initial_patch_size=128, antigen_size=128,
+                 r_ab_ctx: float = 7.0, r_ag_ctx: float = 9.0):
         super().__init__()
         self.initial_patch_size = initial_patch_size
         self.antigen_size = antigen_size
+        self.r_ab_ctx = r_ab_ctx  # 抗体上下文半径
+        self.r_ag_ctx = r_ag_ctx  # 抗原上下文半径
 
     def __call__(self, data):
         antibody = data['antibody']
         antigen = data['antigen']
         complex = data['complex']
+
+        # 1) 距离得到的核心掩码（全复合物级）
         paratope_mask, epitope_mask = compute_interface_masks_complex(complex)
         complex['paratope_mask'] = paratope_mask
         complex['epitope_mask'] = epitope_mask
+
         fragment_type = complex['fragment_type']
+        ab_mask = (fragment_type != constants.Fragment.Antigen)
+        ag_mask = (fragment_type == constants.Fragment.Antigen)
+
+        # 2) 抗体端：核心 + 锚点扩展 + 上下文环
         if isinstance(antibody, dict):
-            ab_mask = (fragment_type != constants.Fragment.Antigen)
-            antibody['paratope_mask'] = paratope_mask[ab_mask]
-            antibody['epitope_mask'] = torch.zeros_like(antibody['paratope_mask'])
+            par_ab = paratope_mask[ab_mask].clone()  # 抗体视图的核心
+            # 锚点：若提供 anchor_flag，则在每条链内把两端 True 之间填满
+            anchor_ab = None
+            if 'anchor_flag' in antibody:
+                anchor_ab = antibody['anchor_flag'].to(par_ab.device).bool()
+            elif 'anchor_flag' in complex:
+                anchor_ab = complex['anchor_flag'][ab_mask].to(par_ab.device).bool()
+            if anchor_ab is not None and 'chain_nb' in antibody:
+                anchor_ab = span_fill_by_chain(anchor_ab, antibody['chain_nb'])
+                par_ab |= anchor_ab
+
+            # 上下文环（基于 CA 半径）
+            CA = constants.BBHeavyAtom.CA
+            pos_rep_ab, valid_ab = _residue_reps(complex['pos_heavyatom'][ab_mask],
+                                                 complex['mask_heavyatom'][ab_mask], CA)
+            ctx_ab = _ctx_by_radius_simple(pos_rep_ab, valid_ab, par_ab, self.r_ab_ctx)
+
+            antibody['paratope_mask'] = par_ab
+            antibody['paratope_ctx_mask'] = ctx_ab
+            antibody['epitope_mask'] = torch.zeros_like(par_ab)
+            antibody['epitope_ctx_mask'] = torch.zeros_like(par_ab)
+
+        # 3) 抗原端：核心 + 上下文环
         if isinstance(antigen, dict):
-            ag_mask = (fragment_type == constants.Fragment.Antigen)
-            antigen['epitope_mask'] = epitope_mask[ag_mask]
-            antigen['paratope_mask'] = torch.zeros_like(antigen['epitope_mask'])
+            epi_ag = epitope_mask[ag_mask].clone()  # 抗原视图的核心
+            CA = constants.BBHeavyAtom.CA
+            pos_rep_ag, valid_ag = _residue_reps(complex['pos_heavyatom'][ag_mask],
+                                                 complex['mask_heavyatom'][ag_mask], CA)
+            ctx_ag = _ctx_by_radius_simple(pos_rep_ag, valid_ag, epi_ag, self.r_ag_ctx)
+
+            antigen['epitope_mask'] = epi_ag
+            antigen['epitope_ctx_mask'] = ctx_ag
+            antigen['paratope_mask'] = torch.zeros_like(epi_ag)
+            antigen['paratope_ctx_mask'] = torch.zeros_like(epi_ag)
+
         return data

@@ -5,15 +5,22 @@ from ..protein import constants
 
 
 def assign_chain_number_(data_list):
-    chains = set()
+    # 1) 按出现顺序建立映射（1-based）
+    chains = {}  # Py3.7+ 字典保持插入顺序
     for data in data_list:
-        chains.update(data['chain_id'])
-    chains = {c: i for i, c in enumerate(chains)}
+        ids = data['chain_id']
+        if isinstance(ids, (str, bytes)):  # 兼容单字符串
+            ids = [ids]
+        for c in ids:
+            if c not in chains:
+                chains[c] = len(chains) + 1
 
+    # 2) 写回每条样本的 chain_nb（保持原顺序）
     for data in data_list:
-        data['chain_nb'] = torch.LongTensor([
-            chains[c] for c in data['chain_id']
-        ])
+        ids = data['chain_id']
+        if isinstance(ids, (str, bytes)):
+            ids = [ids]
+        data['chain_nb'] = torch.tensor([chains[c] for c in ids], dtype=torch.long)
 
 
 def _data_attr(data, name):
@@ -149,24 +156,15 @@ class Split_Chains(object):
             **list_props,
             **tensor_props,
             'cluster': data.get('cluster', None),
+            'id': structure.get('id')
         }
 
         # ===== 选项 A：分别为“抗体组(heavy+light)”与“抗原组(antigen)”分配 chain_nb（各自从 0 编号）=====
         ab_list = [x for x in (data_heavy, data_light) if x is not None]
         ag_list = [x for x in (data_ag,) if x is not None]
 
-        if ab_list:
-            assign_chain_number_(ab_list)  # 仅在抗体内部编号（如 H=0, L=1）
-        if ag_list:
-            assign_chain_number_(ag_list)  # 抗原内部编号（仅一条链时通常全 0）
-
-        # 如果你希望“全局一致编号”（例如 H=0, L=1, Antigen=2），改为把三者合在一起调用一次：
-        # all_list = [x for x in (data_heavy, data_light, data_ag) if x is not None]
-        # if all_list:
-        #     self.assign_chain_number_(all_list)
-
         # 组装函数：把若干链打平成一份 data_out（与你原来的逻辑完全一致）
-        def _assemble(list_of_parts):
+        def _assemble(list_of_parts, isab=True):
             if not list_of_parts:
                 return None
 
@@ -186,11 +184,19 @@ class Split_Chains(object):
 
             list_props = {k: sum(v, start=[]) for k, v in list_props.items()}
             tensor_props = {k: torch.cat(v, dim=0) for k, v in tensor_props.items()}
-            return {**list_props, **tensor_props, 'cluster': data.get('cluster', None)}
+            if isab:
+                seq_md5 = [structure.get('heavy_md5')] if structure.get('heavy_md5') is not None else []
+                if structure.get('light_md5'):
+                    seq_md5.append(structure.get('light_md5'))
+                return {**list_props, **tensor_props, 'cluster': data.get('cluster', None),
+                        'seq_md5': seq_md5}
+            else:
+                return {**list_props, **tensor_props, 'cluster': data.get('cluster', None),
+                        'seq_md5': structure.get('antigen_md5s')}
 
         # 分别组装
-        ab_out = _assemble(ab_list)  # heavy+light 合并后的样本；若两者皆无则为 None
-        ag_out = _assemble(ag_list)  # antigen 的样本；若无 antigen 则为 None
+        ab_out = _assemble(ab_list, isab=True)  # heavy+light 合并后的样本；若两者皆无则为 None
+        ag_out = _assemble(ag_list, isab=False)  # antigen 的样本；若无 antigen 则为 None
 
         # 你可以选择返回二元组或字典；这里用字典更直观
         return {'antibody': ab_out, 'antigen': ag_out, 'complex': data_out}

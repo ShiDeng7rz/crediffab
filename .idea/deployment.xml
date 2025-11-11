@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" serverName="root@36.155.152.28:47689 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" serverName="xiaoliu@114.212.170.115:10114 password" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="A6000-5">
@@ -21,13 +21,6 @@
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="h800">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/root/bayes-tmp/liups/cre-diffab-main" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
@@ -55,7 +48,21 @@
       <paths name="liups@210.28.134.54:22 password (2)">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/nfs06/liups/cre-diffab" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="liups@210.28.134.54:22 password (3)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/nfs06/liups/cre-diffab/" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="liups@210.28.134.54:22 password (4)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/nfs06/liups/cre-diffab" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
@@ -77,6 +84,13 @@
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="liups@210.28.135.34:22 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/nfs06/liups/cre-diffab-main/" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
@@ -179,6 +193,27 @@
         </serverdata>
       </paths>
       <paths name="root@36.155.152.28:48772 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="xiaoliu@114.212.170.115:10114 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data1/sl/liups/cre-diffab/" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="xiaoliu@114.212.170.115:10114 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="xiaoliu@114.212.170.115:10114 password (3)">
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />

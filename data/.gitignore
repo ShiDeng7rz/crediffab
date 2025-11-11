@@ -1,5 +1,5 @@
 *
 !.gitignore
-!sabdab_summary_all.tsv
+!sabdab_summary_all_.tsv
 !examples
 !examples/*
